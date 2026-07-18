@@ -37,12 +37,17 @@ Everything is driven by a **leader key** — press `Ctrl-a`, release, then a com
 | `Ctrl-a` `[` / `]` | Previous / next session |
 | `Ctrl-a` `h` | Back to the Home screen |
 | `Ctrl-a` `r` | Rename the focused session |
+| `Ctrl-a` `!` | Jump to the next session **waiting on you** |
 | `Ctrl-a` `x` | Kill the focused session |
 | `Ctrl-a` `q` | Quit |
 
 **Mouse** works too: click a sidebar row to focus it, scroll the sidebar to cycle, and click/scroll inside a session to interact with Claude.
 
-## Sessions & states
+## Awareness — it tells you which session needs you
+
+claude-deck registers Claude Code **hooks** (per-session, via `--settings` — it never touches your global config) to track each session's real state. When a session that isn't focused starts **waiting on you** (a permission prompt or your next turn), it **rings the bell** and fires a **desktop notification**, and its sidebar icon turns yellow. Hit `Ctrl-a !` to jump straight to it. Fire off several sessions and let it ping you.
+
+Disable the alerts with `--no-bell` and/or `--no-notify`.
 
 Each session shows a colored state icon in the sidebar:
 
@@ -50,7 +55,7 @@ Each session shows a colored state icon in the sidebar:
 |------|-------|
 | green | running |
 | yellow | waiting on you |
-| dim | idle / closed |
+| dim | idle / done |
 | red | error |
 
 ## Icons & fonts

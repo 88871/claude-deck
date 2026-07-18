@@ -4,6 +4,20 @@
 **Status:** Approved for planning
 **Working name:** `claude-deck` (placeholder — rename freely)
 
+> **PIVOT (2026-07-18, after seeing the Tauri build run):** The delivery is a
+> **terminal application (TUI), NOT a desktop window.** The user rejected the
+> windowed Tauri/xterm shell ("if I wanted the application I'd use t3code") — it
+> must run *inside* the terminal. New stack: **Rust + ratatui + crossterm**, with
+> **`tui-term`/`vt100`** embedding each real `claude` PTY in a pane, and
+> **`portable-pty`** for sessions. Pane-emulation engine is swappable → upgrade to
+> **`wezterm-term`** ("our own framework", pro-grade fidelity) if `vt100` feels
+> limiting. Everything below about the WHAT (real `claude` in real panes,
+> multi-session, sidebar states, subscription auth, reaping) still holds; only the
+> shell changes from a windowed WebView to an in-terminal TUI. Section 7's Tauri
+> stack table is superseded by this note. Reusable from the Tauri build: the
+> `SessionManager`/`SessionState` model, `claude` PTY spawn, `resolve_claude_path`,
+> and the `TERM`/`COLORTERM`/`LANG` color fix. Plan: `docs/superpowers/plans/2026-07-18-claude-deck-tui-foundation.md`.
+
 ## 1. What we're building
 
 A lightweight, terminal-native desktop app for running and managing **multiple

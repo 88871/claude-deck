@@ -1,49 +1,29 @@
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import "@xterm/xterm/css/xterm.css";
-import "./styles.css";
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { homeDir } from "@tauri-apps/api/path";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import "./styles.css";
+import { openSession, writeToSession, setSidebarState, renderSidebar, fitActive } from "./sessions";
 
-const term = new Terminal({
-  fontFamily: "Menlo, monospace",
-  fontSize: 13,
-  cursorBlink: true,
-  theme: { background: "#0b0b0e" },
-});
-const fit = new FitAddon();
-term.loadAddon(fit);
-term.open(document.getElementById("terminal")!);
-fit.fit();
-
-let sessionId: string | null = null;
-
-// Decode base64 PTY bytes → Uint8Array; xterm.write handles UTF-8 across
-// chunk boundaries, so we never build a lossy string (Review fix #1).
-function b64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
+async function refreshSidebar() {
+  const sessions = await invoke<{ id: string; label: string; state: string }[]>("list_sessions");
+  renderSidebar(sessions);
 }
 
-listen<{ id: string; b64: string }>("pty://data", (e) => {
-  if (e.payload.id === sessionId) term.write(b64ToBytes(e.payload.b64));
+listen<{ id: string; b64: string }>("pty://data", (e) => writeToSession(e.payload.id, e.payload.b64));
+listen<{ id: string; state: string }>("session://state", (e) => setSidebarState(e.payload.id, e.payload.state));
+
+// Reflow the focused terminal on window resize (Review fix #4).
+window.addEventListener("resize", fitActive);
+
+document.getElementById("new-session")!.addEventListener("click", async () => {
+  const dir = await open({ directory: true, multiple: false });
+  if (typeof dir !== "string") return;
+  try {
+    await openSession(dir);
+    await refreshSidebar();
+  } catch (err) {
+    // Surfaces the §9 onboarding error (e.g. claude not installed / not logged in).
+    // Foundation stopgap; Plan 2 replaces it with an inline onboarding panel.
+    alert(String(err));
+  }
 });
-
-term.onData((data) => {
-  if (sessionId) invoke("write_to_pty", { id: sessionId, data });
-});
-
-function syncSize() {
-  fit.fit();
-  if (sessionId) invoke("resize_pty", { id: sessionId, cols: term.cols, rows: term.rows });
-}
-window.addEventListener("resize", syncSize);
-
-// Temporary: start one session in the home directory on load (replaced in Task 4).
-(async () => {
-  sessionId = await invoke<string>("start_session", { cwd: await homeDir() });
-  syncSize();
-})();

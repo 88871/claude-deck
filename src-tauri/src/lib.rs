@@ -62,6 +62,11 @@ fn resize_pty(state: State<AppState>, id: String, cols: u16, rows: u16) -> Resul
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn list_sessions(state: State<AppState>) -> Vec<core::session::Session> {
+    state.manager.lock().unwrap().list()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState {
@@ -71,7 +76,8 @@ pub fn run() {
     };
     tauri::Builder::default()
         .manage(app_state)
-        .invoke_handler(tauri::generate_handler![start_session, write_to_pty, resize_pty])
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![start_session, write_to_pty, resize_pty, list_sessions])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

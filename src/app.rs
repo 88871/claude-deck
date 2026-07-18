@@ -48,19 +48,6 @@ pub fn cycle_focus(focus: Focus, home_visible: bool, session_count: usize, delta
     entries[new_pos]
 }
 
-/// Compute the new focus after hiding Home.
-/// If sessions exist, moves to Session(0). Otherwise stays at Home (hidden state,
-/// but callers should keep focus at Session(0) guarded by emptiness checks).
-pub fn hide_home_focus(session_count: usize) -> Focus {
-    if session_count > 0 {
-        Focus::Session(0)
-    } else {
-        // No sessions and Home is hidden — best we can do is Session(0) which
-        // the render layer will handle gracefully (shows "no session" hint).
-        Focus::Session(0)
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct App {
@@ -222,9 +209,11 @@ impl App {
                 KeyCode::Char('x') => {
                     match self.focus {
                         Focus::Home => {
-                            // Hide the Home pane.
-                            self.home_visible = false;
-                            self.focus = hide_home_focus(self.sessions.len());
+                            // Hide Home only if sessions exist; otherwise stay at Home.
+                            if !self.sessions.is_empty() {
+                                self.home_visible = false;
+                                self.focus = Focus::Session(0);
+                            }
                         }
                         Focus::Session(_) => self.kill_focused(),
                     }
@@ -392,16 +381,15 @@ mod tests {
         assert_eq!(cycle_focus(Focus::Session(0), false, 0, 1), Focus::Session(0));
     }
 
-    // ── hide_home_focus ───────────────────────────────────────────────────────
+    // ── cycle_focus stale-focus recovery ──────────────────────────────────────
 
     #[test]
-    fn hide_home_with_sessions_moves_to_session_0() {
-        assert_eq!(hide_home_focus(3), Focus::Session(0));
-    }
-
-    #[test]
-    fn hide_home_no_sessions_returns_session_0_safely() {
-        // With no sessions, we return Session(0) — the render layer handles empty gracefully.
-        assert_eq!(hide_home_focus(0), Focus::Session(0));
+    fn cycle_stale_focus_recovers_to_visible_entry() {
+        // When focus is Session(5) but only [Home, Session(0), Session(1)] are visible,
+        // cycling forward from the default recovered position (0) yields Session(0).
+        assert_eq!(
+            cycle_focus(Focus::Session(5), true, 2, 1),
+            Focus::Session(0)
+        );
     }
 }

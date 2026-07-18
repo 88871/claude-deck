@@ -1,5 +1,6 @@
 pub mod app;
 pub mod home;
+pub mod hooks;
 pub mod icons;
 pub mod keys;
 pub mod mouse;
@@ -35,6 +36,13 @@ fn restore_terminal() -> io::Result<()> {
 /// Sets up raw-mode terminal, runs the app, and restores the terminal on exit
 /// or panic.
 pub fn run() -> io::Result<()> {
+    // `__hook` subcommand: read stdin, forward to socket, exit — no TUI.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("__hook") {
+        let sock = args.get(2).cloned().unwrap_or_default();
+        return hooks::forward(&sock);
+    }
+
     // Restore the terminal even on panic, so a crash never corrupts the shell.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

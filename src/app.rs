@@ -70,8 +70,12 @@ impl App {
                 Ok(AppEvent::Output) => {}
                 Ok(AppEvent::Exited { id, clean }) => {
                     self.manager.set_state(&id, if clean { SessionState::Closed } else { SessionState::Error });
-                    // Do NOT remove the session — leave it visible as Closed/Error
-                    // until the user explicitly kills it with Ctrl-a x.
+                    // Leave exited sessions visible; quit only when nothing live remains.
+                    let any_live = self.sessions.iter().any(|(sid, _)| matches!(
+                        self.manager.get(sid).map(|s| s.state),
+                        Some(SessionState::Running) | Some(SessionState::Starting)
+                    ));
+                    if !any_live { self.should_quit = true; }
                 }
                 Err(_) => break,
             }
@@ -92,10 +96,7 @@ impl App {
             }
             Err(_) => {
                 self.manager.set_state(&id, SessionState::Error);
-                // Push a tombstone entry so the user can see the failure in the sidebar.
-                // We use a dummy PtySession — but we can't create one without a real PTY,
-                // so we simply leave the manager entry as Error and don't push to sessions.
-                // The user can start another session manually.
+                // Can't build a PtySession without a live PTY; manager entry stays Error.
             }
         }
     }

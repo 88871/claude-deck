@@ -1,20 +1,18 @@
 use std::path::PathBuf;
-use serde::Serialize;
 use std::collections::HashMap;
 
-#[derive(Serialize, Clone, Copy, PartialEq, Debug)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionState {
     Starting,
     Running,
     WaitingOnYou,
     Idle,
     Parked,
+    Closed,
     Error,
 }
 
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone)]
 pub struct Session {
     pub id: String,
     pub label: String,
@@ -22,6 +20,7 @@ pub struct Session {
     pub state: SessionState,
 }
 
+#[derive(Default)]
 pub struct SessionManager {
     sessions: HashMap<String, Session>,
     order: Vec<String>,
@@ -29,7 +28,7 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
-        Self { sessions: HashMap::new(), order: Vec::new() }
+        Self::default()
     }
 
     pub fn create(&mut self, cwd: PathBuf) -> String {

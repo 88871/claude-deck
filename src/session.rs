@@ -18,6 +18,8 @@ pub struct Session {
     pub label: String,
     pub cwd: PathBuf,
     pub state: SessionState,
+    /// Whether this session is pinned (pinned sessions are never auto-parked).
+    pub pinned: bool,
 }
 
 #[derive(Default)]
@@ -45,7 +47,7 @@ impl SessionManager {
             .unwrap_or_else(|| "session".to_string());
         self.sessions.insert(
             id.clone(),
-            Session { id: id.clone(), label, cwd, state: SessionState::Starting },
+            Session { id: id.clone(), label, cwd, state: SessionState::Starting, pinned: false },
         );
         self.order.push(id.clone());
         id
@@ -74,6 +76,27 @@ impl SessionManager {
     pub fn rename(&mut self, id: &str, new_label: &str) -> bool {
         match self.sessions.get_mut(id) {
             Some(s) => { s.label = new_label.to_string(); true }
+            None => false,
+        }
+    }
+
+    /// Toggle the `pinned` flag for the given session.
+    /// Returns the NEW pinned value, or `false` (and no-ops) if `id` is unknown.
+    pub fn toggle_pin(&mut self, id: &str) -> bool {
+        match self.sessions.get_mut(id) {
+            Some(s) => {
+                s.pinned = !s.pinned;
+                s.pinned
+            }
+            None => false,
+        }
+    }
+
+    /// Explicitly set the `pinned` flag.
+    /// Returns `true` on success, `false` if the id is unknown.
+    pub fn set_pinned(&mut self, id: &str, pinned: bool) -> bool {
+        match self.sessions.get_mut(id) {
+            Some(s) => { s.pinned = pinned; true }
             None => false,
         }
     }
@@ -131,5 +154,52 @@ mod tests {
     fn rename_rejects_unknown_id() {
         let mut m = SessionManager::new();
         assert!(!m.rename("nonexistent-id", "whatever"));
+    }
+
+    // ── pin tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_session_unpinned_by_default() {
+        let mut m = SessionManager::new();
+        let id = m.create(PathBuf::from("/tmp/a"));
+        assert!(!m.get(&id).unwrap().pinned);
+    }
+
+    #[test]
+    fn toggle_pin_known_id_toggles_true_false_true() {
+        let mut m = SessionManager::new();
+        let id = m.create(PathBuf::from("/tmp/a"));
+        // starts false → toggle → true
+        assert!(m.toggle_pin(&id));
+        assert!(m.get(&id).unwrap().pinned);
+        // true → toggle → false
+        assert!(!m.toggle_pin(&id));
+        assert!(!m.get(&id).unwrap().pinned);
+        // false → toggle → true
+        assert!(m.toggle_pin(&id));
+        assert!(m.get(&id).unwrap().pinned);
+    }
+
+    #[test]
+    fn toggle_pin_unknown_id_returns_false_and_noops() {
+        let mut m = SessionManager::new();
+        assert!(!m.toggle_pin("nonexistent-id"));
+        // Manager still empty — nothing to verify, just no panic.
+    }
+
+    #[test]
+    fn set_pinned_known_id() {
+        let mut m = SessionManager::new();
+        let id = m.create(PathBuf::from("/tmp/a"));
+        assert!(m.set_pinned(&id, true));
+        assert!(m.get(&id).unwrap().pinned);
+        assert!(m.set_pinned(&id, false));
+        assert!(!m.get(&id).unwrap().pinned);
+    }
+
+    #[test]
+    fn set_pinned_unknown_id_returns_false() {
+        let mut m = SessionManager::new();
+        assert!(!m.set_pinned("nope", true));
     }
 }

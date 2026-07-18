@@ -75,8 +75,9 @@ impl Prompt {
 pub struct App {
     pub should_quit: bool,
     pub manager: SessionManager,
-    /// All active sessions in creation order: (id, live pty).
-    pub sessions: Vec<(String, PtySession)>,
+    /// All sessions in creation order: (id, pty).
+    /// `Some(pty)` = live process; `None` = parked (no live process, sidebar entry stays).
+    pub sessions: Vec<(String, Option<PtySession>)>,
     /// Current focus: either Home or a session by index.
     pub focus: Focus,
     /// Whether the Home pane is shown in the sidebar.
@@ -160,7 +161,7 @@ impl App {
                     self.manager.set_state(&id, if clean { SessionState::Closed } else { SessionState::Error });
                     // Leave exited sessions visible; only quit when nothing live remains
                     // AND we're not on Home.
-                    let any_live = self.sessions.iter().any(|(sid, _)| matches!(
+                    let any_live = self.sessions.iter().any(|(sid, _pty)| matches!(
                         self.manager.get(sid).map(|s| s.state),
                         Some(SessionState::Running) | Some(SessionState::Starting)
                     ));
@@ -180,7 +181,7 @@ impl App {
                             && old_state != Some(SessionState::WaitingOnYou)
                         {
                             let is_focused = self.sessions.iter().enumerate()
-                                .find(|(_, (id, _))| id == &ev.session_id)
+                                .find(|(_, (id, _pty))| id == &ev.session_id)
                                 .map(|(i, _)| self.focus == Focus::Session(i))
                                 .unwrap_or(false);
 
@@ -226,7 +227,7 @@ impl App {
                 // Running, etc.). No eager Running here — that caused a visible
                 // flicker: Running → Starting → Running on every launch.
                 let new_index = self.sessions.len();
-                self.sessions.push((id, pty));
+                self.sessions.push((id, Some(pty)));
                 self.focus = Focus::Session(new_index); // new session becomes focused
             }
             Err(_) => {
@@ -238,7 +239,7 @@ impl App {
     /// Returns the id of the currently focused session, if any.
     pub fn focused_id(&self) -> Option<String> {
         if let Focus::Session(i) = self.focus {
-            self.sessions.get(i).map(|(id, _)| id.clone())
+            self.sessions.get(i).map(|(id, _pty)| id.clone())
         } else {
             None
         }
@@ -249,7 +250,7 @@ impl App {
     pub fn jump_to_attention(&mut self) {
         // Collect the current states in session order.
         let states: Vec<SessionState> = self.sessions.iter()
-            .map(|(id, _)| self.manager.get(id).map(|s| s.state).unwrap_or(SessionState::Idle))
+            .map(|(id, _pty)| self.manager.get(id).map(|s| s.state).unwrap_or(SessionState::Idle))
             .collect();
         // Determine the search start: use the focused session index, or 0 for Home/unknown.
         let from = match self.focus {
@@ -270,8 +271,10 @@ impl App {
     fn kill_focused(&mut self) {
         let Focus::Session(i) = self.focus else { return };
         if self.sessions.is_empty() { return; }
-        let (id, mut pty) = self.sessions.remove(i);
-        let _ = pty.killer.kill();
+        let (id, pty_opt) = self.sessions.remove(i);
+        if let Some(mut pty) = pty_opt {
+            let _ = pty.killer.kill();
+        }
         self.manager.remove(&id);
         // Move focus to a safe state.
         if !self.sessions.is_empty() {
@@ -291,10 +294,11 @@ impl App {
         if let Focus::Session(i) = self.focus {
             if let Ok((term_w, term_h)) = crossterm::terminal::size() {
                 let (rows, cols) = pane_dims(term_w, term_h);
-                if let Some((_, pty)) = self.sessions.get(i) {
+                if let Some((_, Some(pty))) = self.sessions.get(i) {
                     let _ = pty.master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
                     pty.parser.lock().unwrap().set_size(rows, cols);
                 }
+                // Parked session (None) gets no PTY resize.
             }
         }
         // Home needs no PTY resize.
@@ -321,7 +325,7 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     if let Focus::Session(i) = self.focus {
-                        if let Some((id, _)) = self.sessions.get(i) {
+                        if let Some((id, _pty)) = self.sessions.get(i) {
                             if let Some(s) = self.manager.get(id) {
                                 self.prompt = Some(Prompt::Rename(s.label.clone()));
                             }
@@ -363,6 +367,15 @@ impl App {
                 KeyCode::Char('!') => {
                     self.jump_to_attention();
                 }
+                KeyCode::Char('p') => {
+                    // Toggle pin on the focused session; no-op on Home.
+                    if let Focus::Session(i) = self.focus {
+                        if let Some((id, _pty)) = self.sessions.get(i) {
+                            let id = id.clone();
+                            self.manager.toggle_pin(&id);
+                        }
+                    }
+                }
                 _ => {}
             }
             return;
@@ -373,9 +386,9 @@ impl App {
             return;
         }
 
-        // Forward to the focused session (Home doesn't accept input).
+        // Forward to the focused session (Home and parked sessions don't accept input).
         if let Focus::Session(i) = self.focus {
-            if let Some((_, pty)) = self.sessions.get_mut(i) {
+            if let Some((_, Some(pty))) = self.sessions.get_mut(i) {
                 if let Some(bytes) = keys::encode(&key) {
                     let _ = pty.writer.write_all(&bytes);
                     let _ = pty.writer.flush();
@@ -430,10 +443,10 @@ impl App {
     }
 
     fn on_resize(&mut self, w: u16, h: u16) {
-        // Only resize the focused session's PTY; Home needs no resize.
+        // Only resize the focused session's PTY; Home and parked sessions need no resize.
         if let Focus::Session(i) = self.focus {
             let (rows, cols) = pane_dims(w, h);
-            if let Some((_, pty)) = self.sessions.get(i) {
+            if let Some((_, Some(pty))) = self.sessions.get(i) {
                 let _ = pty.master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
                 pty.parser.lock().unwrap().set_size(rows, cols);
             }
@@ -482,7 +495,8 @@ impl App {
                 }
 
                 // Check against the session's parser screen size.
-                if let Some((_, pty)) = self.sessions.get_mut(i) {
+                // Parked sessions (None) have no PTY — ignore mouse.
+                if let Some((_, Some(pty))) = self.sessions.get_mut(i) {
                     let (screen_rows, screen_cols) = {
                         let parser = pty.parser.lock().unwrap();
                         let screen = parser.screen();

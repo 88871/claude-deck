@@ -37,11 +37,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 
     // Session rows.
-    for (i, (id, _)) in app.sessions.iter().enumerate() {
+    for (i, (id, _pty)) in app.sessions.iter().enumerate() {
         let session_info = app.manager.get(id);
-        let (label, state) = session_info
-            .map(|s| (s.label.clone(), s.state))
-            .unwrap_or_else(|| (id[..8.min(id.len())].to_string(), SessionState::Error));
+        let (label, state, pinned) = session_info
+            .map(|s| (s.label.clone(), s.state, s.pinned))
+            .unwrap_or_else(|| (id[..8.min(id.len())].to_string(), SessionState::Error, false));
 
         let g = icons::state(state, app.icons);
         let glyph_color: Color = icons::state_color(state);
@@ -58,9 +58,12 @@ pub fn draw(f: &mut Frame, app: &App) {
             Style::default()
         };
 
+        // Prepend a pin marker for pinned sessions.
+        let pin_prefix = if pinned { "* " } else { "" };
+
         items.push(ListItem::new(Line::from(vec![
             Span::styled(g, glyph_style),
-            Span::styled(format!(" {}", label), label_style),
+            Span::styled(format!(" {}{}", pin_prefix, label), label_style),
         ])));
     }
 
@@ -100,11 +103,14 @@ pub fn draw(f: &mut Frame, app: &App) {
                     home::render(f, vsplit[0], app.sessions.len(), app.icons);
                 }
                 Focus::Session(i) => {
-                    if let Some((_, pty)) = app.sessions.get(i) {
-                        let parser = pty.parser.lock().unwrap();
-                        f.render_widget(PseudoTerminal::new(parser.screen()), vsplit[0]);
-                    } else {
-                        f.render_widget(Paragraph::new("(no session)"), vsplit[0]);
+                    match app.sessions.get(i) {
+                        Some((_, Some(pty))) => {
+                            let parser = pty.parser.lock().unwrap();
+                            f.render_widget(PseudoTerminal::new(parser.screen()), vsplit[0]);
+                        }
+                        _ => {
+                            f.render_widget(Paragraph::new("parked"), vsplit[0]);
+                        }
                     }
                 }
             }
@@ -130,17 +136,27 @@ pub fn draw(f: &mut Frame, app: &App) {
                 home::render(f, chunks[1], app.sessions.len(), app.icons);
             }
             Focus::Session(i) => {
-                if let Some((_, pty)) = app.sessions.get(i) {
-                    let parser = pty.parser.lock().unwrap();
-                    f.render_widget(
-                        PseudoTerminal::new(parser.screen()).block(main_block),
-                        chunks[1],
-                    );
-                } else {
-                    f.render_widget(
-                        Paragraph::new("(no session — C-a n to start one)").block(main_block),
-                        chunks[1],
-                    );
+                match app.sessions.get(i) {
+                    Some((_, Some(pty))) => {
+                        let parser = pty.parser.lock().unwrap();
+                        f.render_widget(
+                            PseudoTerminal::new(parser.screen()).block(main_block),
+                            chunks[1],
+                        );
+                    }
+                    Some((_, None)) => {
+                        // Parked session: show a placeholder.
+                        f.render_widget(
+                            Paragraph::new("parked").block(main_block),
+                            chunks[1],
+                        );
+                    }
+                    None => {
+                        f.render_widget(
+                            Paragraph::new("(no session — C-a n to start one)").block(main_block),
+                            chunks[1],
+                        );
+                    }
                 }
             }
         }

@@ -11,8 +11,11 @@ pub enum IconMode {
 
 // ── Glyph table ───────────────────────────────────────────────────────────────
 
-const HOME_NERD:  &str = "\u{f015}"; //
-const HOME_ASCII: &str = "⌂";
+const HOME_NERD:    &str = "\u{f015}"; //
+const HOME_ASCII:   &str = "⌂";
+
+const SETTINGS_NERD:  &str = "\u{f013}"; //
+const SETTINGS_ASCII: &str = "⚙";
 
 const FOLDER_NERD:  &str = "\u{f07b}"; //
 const FOLDER_ASCII: &str = "▸";
@@ -39,6 +42,13 @@ pub fn home(mode: IconMode) -> &'static str {
     match mode {
         IconMode::Nerd  => HOME_NERD,
         IconMode::Ascii => HOME_ASCII,
+    }
+}
+
+pub fn settings(mode: IconMode) -> &'static str {
+    match mode {
+        IconMode::Nerd  => SETTINGS_NERD,
+        IconMode::Ascii => SETTINGS_ASCII,
     }
 }
 

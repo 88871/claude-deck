@@ -5,11 +5,12 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use crate::icons::{self, IconMode};
+use crate::config::Config;
+use crate::icons::IconMode;
 use crate::mem::{self, Mem};
 use crate::pty::{self, PtySession};
 use crate::session::{SessionManager, SessionState};
-use crate::{keys, mouse, ui, workspace, Tui};
+use crate::{config, keys, mouse, ui, workspace, Tui};
 
 pub enum AppEvent {
     Input(Event),
@@ -24,12 +25,15 @@ pub enum AppEvent {
 pub enum Focus {
     Home,
     Session(usize),
+    Settings,
 }
 
 // ── Pure focus-transition helpers (testable without a live PTY) ──────────────
 
-/// Build the ordered list of visible "slots": Home (if visible) then each
+/// Build the ordered list of visible "slots" for cycling: Home (if visible) then each
 /// session index.  Returns indices as `Focus` values.
+/// `Focus::Settings` is excluded — it is pinned at the sidebar bottom and not part
+/// of the cycling loop.
 pub fn visible_entries(home_visible: bool, session_count: usize) -> Vec<Focus> {
     let mut v = Vec::new();
     if home_visible {
@@ -43,6 +47,8 @@ pub fn visible_entries(home_visible: bool, session_count: usize) -> Vec<Focus> {
 
 /// Compute the next focus when cycling forward (+1) or backward (-1).
 /// Returns the current focus unchanged if there are no visible entries.
+/// `Focus::Settings` is not in the cycle list; when cycling from Settings,
+/// position defaults to 0 (same fallback as an unrecognised entry).
 pub fn cycle_focus(focus: Focus, home_visible: bool, session_count: usize, delta: i32) -> Focus {
     let entries = visible_entries(home_visible, session_count);
     if entries.is_empty() {
@@ -127,6 +133,13 @@ pub struct App {
     pub warned: HashSet<String>,
     /// sysinfo wrapper for per-process memory queries.
     mem_sys: Mem,
+
+    // ── Settings screen ────────────────────────────────────────────────────
+
+    /// Persisted configuration (loaded at startup, saved on every UI toggle).
+    pub config: Config,
+    /// Which row is highlighted in the Settings screen (0-based).
+    pub settings_cursor: usize,
 }
 
 impl App {
@@ -145,34 +158,72 @@ impl App {
         // pick it up. Best-effort — if it fails, hooks just won't fire.
         let _ = crate::hooks::write_settings_file(&settings_path, &port.to_string());
 
-        // Parse flags from this process's args.
+        // ── Step 1: Load persisted config and apply it as the baseline ────────
+        let cfg = config::load();
+
+        let mut bell_on           = cfg.bell;
+        let mut notify_on         = cfg.desktop_notify;
+        let mut ntfy_topic        = cfg.ntfy_topic.clone();
+        let mut reap_idle         = cfg.reap_idle;
+        let mut reap_timeout      = Duration::from_secs(cfg.reap_timeout_secs);
+        let mut mem_warn_kb: Option<u64> = if cfg.mem_warn_mb > 0 {
+            Some(cfg.mem_warn_mb * 1024)
+        } else {
+            None
+        };
+        let mut icon_mode = if cfg.nerd_icons {
+            IconMode::Nerd
+        } else {
+            IconMode::Ascii
+        };
+
+        // ── Step 2: Apply CLI flags (override config for this run) ────────────
         // This is the TUI path only — __hook is handled before App::new().
         let args: Vec<String> = std::env::args().collect();
-        let bell_on = !args.contains(&"--no-bell".to_string());
-        let notify_on = !args.contains(&"--no-notify".to_string());
-        let reap_idle = args.contains(&"--reap-idle".to_string());
 
-        // --ntfy <topic>  OR  env CLAUDE_DECK_NTFY  (arg wins; absent = disabled)
+        if args.contains(&"--no-bell".to_string()) {
+            bell_on = false;
+        }
+        if args.contains(&"--no-notify".to_string()) {
+            notify_on = false;
+        }
+        if args.contains(&"--reap-idle".to_string()) {
+            reap_idle = true;
+        }
+
+        // --ntfy <topic>  OR  env CLAUDE_DECK_NTFY  (arg wins over env; if neither
+        // is present, keep the value from config)
         let ntfy_env = std::env::var("CLAUDE_DECK_NTFY").ok();
-        let ntfy_topic = crate::notify::ntfy_from(&args, ntfy_env.as_deref());
+        let ntfy_from_cli = crate::notify::ntfy_from(&args, ntfy_env.as_deref());
+        if ntfy_from_cli.is_some() {
+            ntfy_topic = ntfy_from_cli;
+        }
 
-        // --mem-warn <MB>  (default 4096; 0 = disable)
-        let mem_warn_kb: Option<u64> = {
-            let mb = args.windows(2)
-                .find(|w| w[0] == "--mem-warn")
-                .and_then(|w| w[1].parse::<u64>().ok())
-                .unwrap_or(4096);
-            if mb == 0 { None } else { Some(mb * 1024) }
-        };
+        // --mem-warn <MB>  (0 = disable; if absent, keep value from config)
+        if let Some(mb) = args.windows(2)
+            .find(|w| w[0] == "--mem-warn")
+            .and_then(|w| w[1].parse::<u64>().ok())
+        {
+            mem_warn_kb = if mb == 0 { None } else { Some(mb * 1024) };
+        }
 
-        // --reap-timeout <secs>  (default 600)
-        let reap_timeout = {
-            let secs = args.windows(2)
-                .find(|w| w[0] == "--reap-timeout")
-                .and_then(|w| w[1].parse::<u64>().ok())
-                .unwrap_or(600);
-            Duration::from_secs(secs)
-        };
+        // --reap-timeout <secs>  (if absent, keep value from config)
+        if let Some(secs) = args.windows(2)
+            .find(|w| w[0] == "--reap-timeout")
+            .and_then(|w| w[1].parse::<u64>().ok())
+        {
+            reap_timeout = Duration::from_secs(secs);
+        }
+
+        // --nerd / --ascii (override config icon mode for this run)
+        let nerd_env = std::env::var("CLAUDE_DECK_ICONS")
+            .map(|v| v.eq_ignore_ascii_case("nerd"))
+            .unwrap_or(false);
+        if nerd_env || args.iter().any(|a| a == "--nerd") {
+            icon_mode = IconMode::Nerd;
+        } else if args.iter().any(|a| a == "--ascii") {
+            icon_mode = IconMode::Ascii;
+        }
 
         let mut app = Self {
             should_quit: false,
@@ -183,7 +234,7 @@ impl App {
             prompt: None,
             leader: false,
             claude_path: pty::resolve_claude_path(),
-            icons: icons::detect_mode(),
+            icons: icon_mode,
             bell_on,
             notify_on,
             ntfy_topic,
@@ -198,6 +249,8 @@ impl App {
             rss: HashMap::new(),
             warned: HashSet::new(),
             mem_sys: Mem::new(),
+            config: cfg,
+            settings_cursor: 0,
         };
 
         // ── Workspace restore ──────────────────────────────────────────────────
@@ -316,19 +369,22 @@ impl App {
                                 let label = self.manager.get(&ev.session_id)
                                     .map(|s| s.label.clone())
                                     .unwrap_or_else(|| ev.session_id.clone());
-                                if self.bell_on {
-                                    crate::notify::bell();
-                                }
-                                if self.notify_on {
-                                    crate::notify::desktop(&label);
-                                }
-                                // ── Feature A: phone push via ntfy.sh ─────
-                                if let Some(topic) = &self.ntfy_topic {
-                                    crate::notify::push_ntfy(
-                                        topic,
-                                        "claude-deck",
-                                        &format!("{label} needs you"),
-                                    );
+                                // ── DND guard: suppress ALL alerts when Do Not Disturb is on ──
+                                if !self.config.dnd {
+                                    if self.bell_on {
+                                        crate::notify::bell();
+                                    }
+                                    if self.notify_on {
+                                        crate::notify::desktop(&label);
+                                    }
+                                    // ── Feature A: phone push via ntfy.sh ─────
+                                    if let Some(topic) = &self.ntfy_topic {
+                                        crate::notify::push_ntfy(
+                                            topic,
+                                            "claude-deck",
+                                            &format!("{label} needs you"),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -388,10 +444,10 @@ impl App {
         let states: Vec<SessionState> = self.sessions.iter()
             .map(|(id, _pty)| self.manager.get(id).map(|s| s.state).unwrap_or(SessionState::Idle))
             .collect();
-        // Determine the search start: use the focused session index, or 0 for Home/unknown.
+        // Determine the search start: use the focused session index, or 0 for Home/Settings.
         let from = match self.focus {
             Focus::Session(i) => i,
-            Focus::Home => {
+            Focus::Home | Focus::Settings => {
                 // Start from the last session so the search begins at index 0.
                 states.len().saturating_sub(1)
             }
@@ -586,6 +642,12 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        // Settings mode: navigate the settings list, do NOT forward to any PTY.
+        if self.focus == Focus::Settings {
+            self.on_settings_key(key);
+            return;
+        }
+
         // Prompt mode: edit the buffer, do NOT forward to any PTY.
         if self.prompt.is_some() {
             self.on_input_key(key);
@@ -628,6 +690,7 @@ impl App {
                             }
                         }
                         Focus::Session(_) => self.kill_focused(),
+                        Focus::Settings => {} // no-op on Settings screen
                     }
                 }
                 KeyCode::Char('R') => {
@@ -669,6 +732,11 @@ impl App {
                             self.save_workspace();
                         }
                     }
+                }
+                KeyCode::Char('s') => {
+                    // Open the Settings screen.
+                    self.focus = Focus::Settings;
+                    self.settings_cursor = 0;
                 }
                 _ => {}
             }
@@ -756,6 +824,69 @@ impl App {
         }
     }
 
+    /// Handle a key while the Settings screen is focused.
+    /// No keystrokes are forwarded to a PTY from here.
+    fn on_settings_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.focus = Focus::Home;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.settings_cursor > 0 {
+                    self.settings_cursor -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = SETTINGS_ROW_COUNT_TOTAL.saturating_sub(1);
+                if self.settings_cursor < max {
+                    self.settings_cursor += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.toggle_settings_bool_at_cursor();
+            }
+            _ => {}
+        }
+    }
+
+    /// Toggle the boolean setting at the current `settings_cursor` row.
+    /// Non-boolean rows (ntfy_topic, reap_timeout_secs, mem_warn_mb) are no-ops in SET1.
+    fn toggle_settings_bool_at_cursor(&mut self) {
+        match self.settings_cursor {
+            0 => { // dnd
+                self.config.dnd = !self.config.dnd;
+            }
+            1 => { // bell
+                self.config.bell = !self.config.bell;
+                self.bell_on = self.config.bell;
+            }
+            2 => { // desktop_notify
+                self.config.desktop_notify = !self.config.desktop_notify;
+                self.notify_on = self.config.desktop_notify;
+            }
+            3 => { // ntfy_topic — no-op in SET1
+            }
+            4 => { // reap_idle
+                self.config.reap_idle = !self.config.reap_idle;
+                self.reap_idle = self.config.reap_idle;
+            }
+            5 => { // reap_timeout_secs — no-op in SET1
+            }
+            6 => { // mem_warn_mb — no-op in SET1
+            }
+            7 => { // nerd_icons
+                self.config.nerd_icons = !self.config.nerd_icons;
+                self.icons = if self.config.nerd_icons {
+                    IconMode::Nerd
+                } else {
+                    IconMode::Ascii
+                };
+            }
+            _ => {}
+        }
+        config::save(&self.config);
+    }
+
     /// Kill the live PTY for `id` and respawn with `--resume`, keeping the
     /// session in the same slot.  State resets to Starting.  Clears RSS/warned.
     ///
@@ -814,11 +945,16 @@ impl App {
             // ── Sidebar region ────────────────────────────────────────────────
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(new_focus) = mouse::sidebar_hit(m.row, self.home_visible, self.sessions.len()) {
+                    let term_h = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
+                    if let Some(new_focus) = mouse::sidebar_hit_with_height(
+                        m.row, self.home_visible, self.sessions.len(), term_h,
+                    ) {
                         self.focus = new_focus;
                         if matches!(new_focus, Focus::Session(_)) {
                             self.maybe_revive_focused();
                             self.sync_focus_size();
+                        } else if new_focus == Focus::Settings {
+                            self.settings_cursor = 0;
                         }
                     }
                 }
@@ -836,7 +972,7 @@ impl App {
             }
         } else {
             // ── Main pane region ──────────────────────────────────────────────
-            // Only forward when a session is focused; ignore when Home is focused.
+            // Only forward when a session is focused; ignore for Home and Settings.
             if let Focus::Session(i) = self.focus {
                 // Translate terminal coordinates to 1-based pane-interior coords.
                 // The pane interior starts after the 26-wide sidebar and the
@@ -882,6 +1018,11 @@ pub fn pane_dims(term_w: u16, term_h: u16) -> (u16, u16) {
     let rows = term_h.saturating_sub(2).max(1);
     (rows, cols)
 }
+
+/// Total number of rows in the Settings list (one per managed setting).
+/// Order: dnd, bell, desktop_notify, ntfy_topic, reap_idle, reap_timeout_secs,
+///        mem_warn_mb, nerd_icons.
+pub const SETTINGS_ROW_COUNT_TOTAL: usize = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
 

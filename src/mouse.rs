@@ -1,6 +1,11 @@
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use crate::app::Focus;
 
+/// The sidebar has a fixed height for the terminal; the Settings row is pinned
+/// at the last interior row.  This constant is the sidebar inner height we
+/// reserve for pinned rows (Settings = 1 row at the bottom).
+pub const SETTINGS_ROW_COUNT: u16 = 1;
+
 /// Shared sidebar width constant — must match the `Constraint::Length` in `ui.rs`.
 pub const SIDEBAR_WIDTH: u16 = 26;
 
@@ -13,6 +18,8 @@ pub const SIDEBAR_WIDTH: u16 = 26;
 ///   - With `home_visible=false`: row 1 → `Focus::Session(0)`.
 ///
 /// Row 0 (border) or any row past the last entry → `None`.
+///
+/// Does NOT handle the Settings row — use `sidebar_hit_with_height` for that.
 pub fn sidebar_hit(row: u16, home_visible: bool, session_count: usize) -> Option<Focus> {
     if row == 0 {
         return None;
@@ -36,6 +43,32 @@ pub fn sidebar_hit(row: u16, home_visible: bool, session_count: usize) -> Option
             None
         }
     }
+}
+
+/// Extended sidebar hit-test that also handles the Settings row pinned at the
+/// bottom of the sidebar interior.
+///
+/// `term_height` is the full terminal height in rows (from `crossterm::terminal::size()`).
+/// The sidebar block has a 1-row top border and 1-row bottom border, so the last
+/// interior row is `term_height - 2`.  That last interior row is reserved for
+/// `Focus::Settings`.
+///
+/// For all other rows the behaviour matches `sidebar_hit`.
+pub fn sidebar_hit_with_height(
+    row: u16,
+    home_visible: bool,
+    session_count: usize,
+    term_height: u16,
+) -> Option<Focus> {
+    // The last interior row (0-indexed terminal row = term_height - 2).
+    // The sidebar block inner area runs from row 1 to row (term_height - 2) inclusive.
+    let settings_row = term_height.saturating_sub(2);
+
+    if row == settings_row && settings_row > 0 {
+        return Some(Focus::Settings);
+    }
+
+    sidebar_hit(row, home_visible, session_count)
 }
 
 /// Encode a `MouseEvent` as an SGR mouse sequence for the pane-relative

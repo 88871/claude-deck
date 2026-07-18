@@ -86,6 +86,10 @@ pub struct App {
     pub leader: bool, // Ctrl-a pressed, awaiting command
     pub claude_path: Option<String>,
     pub icons: IconMode,
+    /// Whether to ring the terminal bell when a session needs attention.
+    pub bell_on: bool,
+    /// Whether to fire a macOS desktop notification when a session needs attention.
+    pub notify_on: bool,
     /// Unix socket path used by the hook listener; removed on quit.
     socket_path: std::path::PathBuf,
     /// Temp settings file path written for `--settings`; removed on quit.
@@ -111,6 +115,12 @@ impl App {
         let socket_str = socket_path.to_string_lossy().into_owned();
         let _ = crate::hooks::write_settings_file(&settings_path, &socket_str);
 
+        // Parse --no-bell / --no-notify flags from this process's args.
+        // This is the TUI path only — __hook is handled before App::new().
+        let args: Vec<String> = std::env::args().collect();
+        let bell_on = !args.contains(&"--no-bell".to_string());
+        let notify_on = !args.contains(&"--no-notify".to_string());
+
         Self {
             should_quit: false,
             manager: SessionManager::default(),
@@ -121,6 +131,8 @@ impl App {
             leader: false,
             claude_path: pty::resolve_claude_path(),
             icons: icons::detect_mode(),
+            bell_on,
+            notify_on,
             socket_path,
             settings_path,
             tx,
@@ -161,8 +173,34 @@ impl App {
                     }
                 }
                 Ok(AppEvent::Hook(ev)) => {
-                    if let Some(state) = state_for_hook(&ev) {
-                        self.manager.set_state(&ev.session_id, state);
+                    if let Some(new_state) = state_for_hook(&ev) {
+                        // Capture the OLD state before updating.
+                        let old_state = self.manager.get(&ev.session_id).map(|s| s.state);
+                        self.manager.set_state(&ev.session_id, new_state);
+
+                        // Fire attention signals on the WaitingOnYou transition edge,
+                        // but only when this session is NOT the currently focused one.
+                        if new_state == SessionState::WaitingOnYou
+                            && old_state != Some(SessionState::WaitingOnYou)
+                        {
+                            let is_focused = self.sessions.iter().enumerate()
+                                .find(|(_, (id, _))| id == &ev.session_id)
+                                .map(|(i, _)| self.focus == Focus::Session(i))
+                                .unwrap_or(false);
+
+                            if !is_focused {
+                                // Resolve the sidebar label for the notification.
+                                let label = self.manager.get(&ev.session_id)
+                                    .map(|s| s.label.clone())
+                                    .unwrap_or_else(|| ev.session_id.clone());
+                                if self.bell_on {
+                                    crate::notify::bell();
+                                }
+                                if self.notify_on {
+                                    crate::notify::desktop(&label);
+                                }
+                            }
+                        }
                     }
                 }
                 Err(_) => break,
@@ -207,6 +245,27 @@ impl App {
             self.sessions.get(i).map(|(id, _)| id.clone())
         } else {
             None
+        }
+    }
+
+    /// Jump focus to the next session that is `WaitingOnYou`, searching after
+    /// the currently focused index (wrapping). No-op if no such session exists.
+    pub fn jump_to_attention(&mut self) {
+        // Collect the current states in session order.
+        let states: Vec<SessionState> = self.sessions.iter()
+            .map(|(id, _)| self.manager.get(id).map(|s| s.state).unwrap_or(SessionState::Idle))
+            .collect();
+        // Determine the search start: use the focused session index, or 0 for Home/unknown.
+        let from = match self.focus {
+            Focus::Session(i) => i,
+            Focus::Home => {
+                // Start from the last session so the search begins at index 0.
+                states.len().saturating_sub(1)
+            }
+        };
+        if let Some(i) = next_attention(&states, from) {
+            self.focus = Focus::Session(i);
+            self.sync_focus_size();
         }
     }
 
@@ -304,6 +363,9 @@ impl App {
                 KeyCode::Char(']') => {
                     self.focus = cycle_focus(self.focus, self.home_visible, self.sessions.len(), 1);
                     self.sync_focus_size();
+                }
+                KeyCode::Char('!') => {
+                    self.jump_to_attention();
                 }
                 _ => {}
             }
@@ -473,6 +535,22 @@ pub fn state_for_hook(ev: &crate::hooks::HookEvent) -> Option<SessionState> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns the index of the next session (searching AFTER `from`, wrapping)
+/// whose state is `WaitingOnYou`; `None` if there are no such sessions.
+pub fn next_attention(states: &[SessionState], from: usize) -> Option<usize> {
+    let n = states.len();
+    if n == 0 { return None; }
+    for offset in 1..=n {
+        let i = (from + offset) % n;
+        if states[i] == SessionState::WaitingOnYou {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +693,51 @@ mod tests {
     fn state_for_hook_unknown_event_returns_none() {
         let ev = make_ev("SomeUnknownEvent", None);
         assert_eq!(state_for_hook(&ev), None);
+    }
+
+    // ── next_attention ────────────────────────────────────────────────────────
+
+    #[test]
+    fn next_attention_finds_next_waiting_after_from() {
+        use SessionState::*;
+        let states = [Running, WaitingOnYou, Idle, WaitingOnYou];
+        // from=0: next waiting is index 1
+        assert_eq!(next_attention(&states, 0), Some(1));
+    }
+
+    #[test]
+    fn next_attention_wraps_around() {
+        use SessionState::*;
+        // from=2, only waiting at 1 — must wrap
+        let states = [Idle, WaitingOnYou, Running, Idle];
+        assert_eq!(next_attention(&states, 2), Some(1));
+    }
+
+    #[test]
+    fn next_attention_returns_none_when_none_waiting() {
+        use SessionState::*;
+        let states = [Running, Idle, Running];
+        assert_eq!(next_attention(&states, 0), None);
+    }
+
+    #[test]
+    fn next_attention_skips_non_waiting_states() {
+        use SessionState::*;
+        // WaitingOnYou only at 3; from=0 should skip 1 and 2
+        let states = [Idle, Running, Starting, WaitingOnYou];
+        assert_eq!(next_attention(&states, 0), Some(3));
+    }
+
+    #[test]
+    fn next_attention_does_not_return_from_itself_unless_only_one() {
+        use SessionState::*;
+        // from=1 (WaitingOnYou itself); should wrap and still find 1 if it's the only one
+        let states = [Running, WaitingOnYou, Idle];
+        assert_eq!(next_attention(&states, 1), Some(1));
+    }
+
+    #[test]
+    fn next_attention_empty_returns_none() {
+        assert_eq!(next_attention(&[], 0), None);
     }
 }

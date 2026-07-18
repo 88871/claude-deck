@@ -4,6 +4,7 @@ pub mod hooks;
 pub mod icons;
 pub mod keys;
 pub mod mouse;
+pub mod notify;
 pub mod pty;
 pub mod session;
 pub mod ui;

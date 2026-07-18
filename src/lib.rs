@@ -9,6 +9,7 @@ pub mod notify;
 pub mod pty;
 pub mod session;
 pub mod ui;
+pub mod workspace;
 
 use std::io::{self, Stdout};
 use crossterm::{

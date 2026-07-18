@@ -9,7 +9,7 @@ use crate::icons::{self, IconMode};
 use crate::mem::{self, Mem};
 use crate::pty::{self, PtySession};
 use crate::session::{SessionManager, SessionState};
-use crate::{keys, mouse, ui, Tui};
+use crate::{keys, mouse, ui, workspace, Tui};
 
 pub enum AppEvent {
     Input(Event),
@@ -166,7 +166,7 @@ impl App {
             Duration::from_secs(secs)
         };
 
-        Self {
+        let mut app = Self {
             should_quit: false,
             manager: SessionManager::default(),
             sessions: Vec::new(),
@@ -188,7 +188,44 @@ impl App {
             rss: HashMap::new(),
             warned: HashSet::new(),
             mem_sys: Mem::new(),
+        };
+
+        // ── Workspace restore ──────────────────────────────────────────────────
+        // Unless the user passes `--no-restore`, load the persisted workspace
+        // and repopulate `sessions` as PARKED (None pty) entries.  The existing
+        // revive-on-focus path resumes each session via `claude --resume` when
+        // the user focuses it.  No processes are spawned here (RAM-safe).
+        if !args.contains(&"--no-restore".to_string()) {
+            for e in workspace::load() {
+                app.manager.create_with_id(e.id.clone(), e.cwd.clone());
+                app.manager.rename(&e.id, &e.label);
+                if e.pinned {
+                    app.manager.set_pinned(&e.id, true);
+                }
+                app.manager.set_state(&e.id, SessionState::Parked);
+                app.sessions.push((e.id, None));
+            }
+            // Focus stays at Home regardless of how many sessions were restored.
         }
+
+        app
+    }
+
+    /// Build a workspace snapshot from the current session list (all sessions,
+    /// live or parked).
+    fn snapshot_entries(&self) -> Vec<workspace::Entry> {
+        self.manager.list().into_iter().map(|s| workspace::Entry {
+            id: s.id,
+            label: s.label,
+            cwd: s.cwd,
+            pinned: s.pinned,
+        }).collect()
+    }
+
+    /// Persist the current workspace to the config-dir JSON file.
+    /// Errors are silently ignored (see `workspace::save`).
+    fn save_workspace(&self) {
+        workspace::save(&self.snapshot_entries());
     }
 
     pub fn run(&mut self, terminal: &mut Tui) -> io::Result<()> {
@@ -304,6 +341,7 @@ impl App {
                 self.manager.set_state(&id, SessionState::Error);
             }
         }
+        self.save_workspace();
     }
 
     /// Returns the id of the currently focused session, if any.
@@ -358,6 +396,7 @@ impl App {
             self.home_visible = true;
             self.focus = Focus::Home;
         }
+        self.save_workspace();
     }
 
     /// If the currently focused session is parked, revive it immediately.
@@ -405,6 +444,7 @@ impl App {
         }
         self.manager.set_state(id, SessionState::Parked);
         self.idle_since.remove(id);
+        self.save_workspace();
     }
 
     /// Revive the session at `idx` if it is currently parked (`None` pty).
@@ -596,6 +636,7 @@ impl App {
                         if let Some((id, _pty)) = self.sessions.get(i) {
                             let id = id.clone();
                             self.manager.toggle_pin(&id);
+                            self.save_workspace();
                         }
                     }
                 }
@@ -660,6 +701,7 @@ impl App {
                             if !trimmed.is_empty() {
                                 if let Some(id) = self.focused_id() {
                                     self.manager.rename(&id, &trimmed);
+                                    self.save_workspace();
                                 }
                             }
                             // Empty buffer → cancel without changing the name.

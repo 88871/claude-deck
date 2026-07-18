@@ -14,14 +14,31 @@ pub struct PtySession {
     pub parser: Arc<Mutex<vt100::Parser>>,
 }
 
-/// Login-shell probe for the `claude` binary (Finder/packaged launches get a
-/// minimal PATH). Returns None if not found.
+/// Resolve the path to the `claude` binary.
+///
+/// Strategy:
+/// 1. Try `which::which("claude")` — works on all platforms, respects the
+///    current PATH (fast, no subprocess).
+/// 2. On Unix only, fall back to a login-shell probe so that Finder/packaged
+///    launches (which inherit a minimal PATH) can still find claude if it lives
+///    in a shell-profile-managed dir like ~/.local/bin.
 pub fn resolve_claude_path() -> Option<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let out = Command::new(&shell).args(["-lc", "command -v claude"]).output().ok()?;
-    if !out.status.success() { return None; }
-    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if p.is_empty() { None } else { Some(p) }
+    if let Ok(p) = which::which("claude") {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    #[cfg(unix)]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        if let Ok(o) = Command::new(&shell).args(["-lc", "command -v claude"]).output() {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn spawn(

@@ -29,6 +29,7 @@ pub fn spawn(
     cwd: &Path,
     rows: u16,
     cols: u16,
+    id: String,
     tx: Sender<AppEvent>,
 ) -> std::io::Result<PtySession> {
     let pty_system = native_pty_system();
@@ -70,7 +71,7 @@ pub fn spawn(
     let mut child = child;
     std::thread::spawn(move || {
         let clean = child.wait().map(|s| s.success()).unwrap_or(false);
-        let _ = tx.send(AppEvent::Exited { clean });
+        let _ = tx.send(AppEvent::Exited { id, clean });
     });
 
     Ok(PtySession { writer, master: pair.master, killer, parser })

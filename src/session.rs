@@ -33,6 +33,12 @@ impl SessionManager {
 
     pub fn create(&mut self, cwd: PathBuf) -> String {
         let id = uuid::Uuid::new_v4().to_string();
+        self.create_with_id(id, cwd)
+    }
+
+    /// Register a session whose id is the provided string — used when the
+    /// caller needs the id to equal the `--session-id` passed to `claude`.
+    pub fn create_with_id(&mut self, id: String, cwd: PathBuf) -> String {
         let label = cwd
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())

@@ -106,6 +106,11 @@ impl App {
             let _ = hook_tx.send(AppEvent::Hook(ev));
         });
 
+        // Write the shared hooks settings file so `--settings` sessions can
+        // pick it up. Best-effort — if it fails, hooks just won't fire.
+        let socket_str = socket_path.to_string_lossy().into_owned();
+        let _ = crate::hooks::write_settings_file(&settings_path, &socket_str);
+
         Self {
             should_quit: false,
             manager: SessionManager::default(),
@@ -155,8 +160,11 @@ impl App {
                         self.should_quit = true;
                     }
                 }
-                // Task A3 will fill in state-machine logic; for now just redraw.
-                Ok(AppEvent::Hook(_ev)) => {}
+                Ok(AppEvent::Hook(ev)) => {
+                    if let Some(state) = state_for_hook(&ev) {
+                        self.manager.set_state(&ev.session_id, state);
+                    }
+                }
                 Err(_) => break,
             }
             terminal.draw(|f| ui::draw(f, self))?;
@@ -172,9 +180,16 @@ impl App {
     /// Spawn a new session in `cwd` and push it onto `sessions`.
     fn start_session(&mut self, cwd: PathBuf, rows: u16, cols: u16) {
         let Some(path) = self.claude_path.clone() else { return };
-        let id = self.manager.create(cwd.clone());
-        match pty::spawn(&path, &cwd, rows, cols, id.clone(), self.tx.clone()) {
+        // Generate the uuid ONCE so it is equal to the `--session-id` arg
+        // passed to `claude` and the id stored in the SessionManager — the
+        // hook listener uses this to correlate incoming events.
+        let id = uuid::Uuid::new_v4().to_string();
+        let settings_str = self.settings_path.to_string_lossy().into_owned();
+        self.manager.create_with_id(id.clone(), cwd.clone());
+        match pty::spawn(&path, &cwd, rows, cols, id.clone(), &settings_str, self.tx.clone()) {
             Ok(pty) => {
+                // State will be driven by SessionStart hook; set Running as
+                // a fallback in case hooks aren't available.
                 self.manager.set_state(&id, SessionState::Running);
                 let new_index = self.sessions.len();
                 self.sessions.push((id, pty));
@@ -438,6 +453,26 @@ pub fn pane_dims(term_w: u16, term_h: u16) -> (u16, u16) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Map a `HookEvent` to the `SessionState` it implies, or `None` for events
+/// that don't drive a state transition (e.g. unknown event names).
+pub fn state_for_hook(ev: &crate::hooks::HookEvent) -> Option<SessionState> {
+    match ev.event.as_str() {
+        "SessionStart"      => Some(SessionState::Starting),
+        "UserPromptSubmit"  => Some(SessionState::Running),
+        "Stop"              => Some(SessionState::Idle),
+        "Notification" => {
+            if ev.notification_type.as_deref() == Some("idle_prompt") {
+                Some(SessionState::Idle)
+            } else {
+                Some(SessionState::WaitingOnYou)
+            }
+        }
+        _ => None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,5 +557,63 @@ mod tests {
             cycle_focus(Focus::Session(5), true, 2, 1),
             Focus::Session(0)
         );
+    }
+
+    // ── state_for_hook ────────────────────────────────────────────────────────
+
+    fn make_ev(event: &str, notification_type: Option<&str>) -> crate::hooks::HookEvent {
+        crate::hooks::HookEvent {
+            session_id: "test-session".to_string(),
+            event: event.to_string(),
+            notification_type: notification_type.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn state_for_hook_session_start_returns_starting() {
+        let ev = make_ev("SessionStart", None);
+        assert_eq!(state_for_hook(&ev), Some(SessionState::Starting));
+    }
+
+    #[test]
+    fn state_for_hook_user_prompt_submit_returns_running() {
+        let ev = make_ev("UserPromptSubmit", None);
+        assert_eq!(state_for_hook(&ev), Some(SessionState::Running));
+    }
+
+    #[test]
+    fn state_for_hook_stop_returns_idle() {
+        let ev = make_ev("Stop", None);
+        assert_eq!(state_for_hook(&ev), Some(SessionState::Idle));
+    }
+
+    #[test]
+    fn state_for_hook_notification_permission_prompt_returns_waiting() {
+        let ev = make_ev("Notification", Some("permission_prompt"));
+        assert_eq!(state_for_hook(&ev), Some(SessionState::WaitingOnYou));
+    }
+
+    #[test]
+    fn state_for_hook_notification_idle_prompt_returns_idle() {
+        let ev = make_ev("Notification", Some("idle_prompt"));
+        assert_eq!(state_for_hook(&ev), Some(SessionState::Idle));
+    }
+
+    #[test]
+    fn state_for_hook_notification_unknown_type_returns_waiting() {
+        let ev = make_ev("Notification", Some("some_unknown_type"));
+        assert_eq!(state_for_hook(&ev), Some(SessionState::WaitingOnYou));
+    }
+
+    #[test]
+    fn state_for_hook_notification_no_type_returns_waiting() {
+        let ev = make_ev("Notification", None);
+        assert_eq!(state_for_hook(&ev), Some(SessionState::WaitingOnYou));
+    }
+
+    #[test]
+    fn state_for_hook_unknown_event_returns_none() {
+        let ev = make_ev("SomeUnknownEvent", None);
+        assert_eq!(state_for_hook(&ev), None);
     }
 }

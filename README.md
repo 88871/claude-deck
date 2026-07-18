@@ -55,11 +55,15 @@ Each session shows a colored state icon in the sidebar:
 
 ## Icons & fonts
 
-The UI uses **Nerd Font icons** by default (the  home glyph, folder icons, state dots). If your terminal isn't using a [Nerd Font](https://www.nerdfonts.com/), run with a clean Unicode fallback instead:
+The UI uses **universal Unicode symbols** by default (works in any terminal — no special font needed).
+
+To opt in to **Nerd Font icons** (the home glyph, folder icons, etc.) pass `--nerd` or set the env var:
 
 ```bash
-claude-deck --ascii          # or set CLAUDE_DECK_ICONS=ascii
+claude-deck --nerd           # or: CLAUDE_DECK_ICONS=nerd claude-deck
 ```
+
+This requires your terminal to be configured with a [Nerd Font](https://www.nerdfonts.com/). The demo GIF above was recorded in `--nerd` mode.
 
 ## How it works
 

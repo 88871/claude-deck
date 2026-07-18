@@ -86,24 +86,30 @@ pub fn state_color(s: SessionState) -> Color {
 
 // ── Mode detection ────────────────────────────────────────────────────────────
 
-/// Pure function: given CLI args and whether the ascii env vars are set,
+/// Pure function: given CLI args and whether the nerd env var is set,
 /// return the appropriate IconMode. Testable without touching the real env.
-pub fn mode_from(args: &[String], ascii_env: bool) -> IconMode {
-    if ascii_env || args.iter().any(|a| a == "--ascii") {
-        IconMode::Ascii
-    } else {
+///
+/// Default is `IconMode::Ascii` (universal Unicode symbols, works in any
+/// terminal). `IconMode::Nerd` is returned only when the user explicitly
+/// opts in via `--nerd` in args or `nerd_env == true`.
+///
+/// `--ascii` / `CLAUDE_DECK_ICONS=ascii` are kept as explicit no-ops for
+/// backward-compat (they select Ascii, which is already the default).
+pub fn mode_from(args: &[String], nerd_env: bool) -> IconMode {
+    if nerd_env || args.iter().any(|a| a == "--nerd") {
         IconMode::Nerd
+    } else {
+        IconMode::Ascii
     }
 }
 
 /// Detect the icon mode from the real process environment and CLI args.
 pub fn detect_mode() -> IconMode {
     let args: Vec<String> = std::env::args().collect();
-    let ascii_env = std::env::var("CLAUDE_DECK_ICONS")
-        .map(|v| v.eq_ignore_ascii_case("ascii"))
-        .unwrap_or(false)
-        || std::env::var("NO_NERD_FONT").is_ok();
-    mode_from(&args, ascii_env)
+    let nerd_env = std::env::var("CLAUDE_DECK_ICONS")
+        .map(|v| v.eq_ignore_ascii_case("nerd"))
+        .unwrap_or(false);
+    mode_from(&args, nerd_env)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -204,31 +210,40 @@ mod tests {
     // ── mode_from: pure detection logic ──────────────────────────────────────
 
     #[test]
-    fn mode_from_default_is_nerd() {
-        assert_eq!(mode_from(&[], false), IconMode::Nerd);
+    fn mode_from_default_is_ascii() {
+        // No args, nerd_env=false → default is Ascii (works in any terminal)
+        assert_eq!(mode_from(&[], false), IconMode::Ascii);
     }
 
     #[test]
-    fn mode_from_ascii_flag_forces_ascii() {
+    fn mode_from_nerd_flag_enables_nerd() {
+        let args = vec!["claude-deck".to_string(), "--nerd".to_string()];
+        assert_eq!(mode_from(&args, false), IconMode::Nerd);
+    }
+
+    #[test]
+    fn mode_from_nerd_env_enables_nerd() {
+        // nerd_env=true → Nerd (caller set CLAUDE_DECK_ICONS=nerd)
+        assert_eq!(mode_from(&[], true), IconMode::Nerd);
+    }
+
+    #[test]
+    fn mode_from_nerd_flag_and_env_both_enable_nerd() {
+        let args = vec!["--nerd".to_string()];
+        assert_eq!(mode_from(&args, true), IconMode::Nerd);
+    }
+
+    #[test]
+    fn mode_from_ascii_flag_is_noop_stays_ascii() {
+        // --ascii is a backward-compat no-op; default is already Ascii
         let args = vec!["claude-deck".to_string(), "--ascii".to_string()];
         assert_eq!(mode_from(&args, false), IconMode::Ascii);
     }
 
     #[test]
-    fn mode_from_ascii_env_forces_ascii() {
-        assert_eq!(mode_from(&[], true), IconMode::Ascii);
-    }
-
-    #[test]
-    fn mode_from_ascii_flag_and_env_both_force_ascii() {
-        let args = vec!["--ascii".to_string()];
-        assert_eq!(mode_from(&args, true), IconMode::Ascii);
-    }
-
-    #[test]
-    fn mode_from_other_flags_leave_nerd() {
+    fn mode_from_other_flags_stay_ascii() {
         let args = vec!["--verbose".to_string(), "--debug".to_string()];
-        assert_eq!(mode_from(&args, false), IconMode::Nerd);
+        assert_eq!(mode_from(&args, false), IconMode::Ascii);
     }
 
     // ── all states produce distinct nerd/ascii glyphs ─────────────────────────

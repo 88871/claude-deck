@@ -2,10 +2,15 @@
 name = "claude-deck"
 version = "0.1.0"
 edition = "2021"
+default-run = "claude-deck"
 
 [[bin]]
 name = "claude-deck"
 path = "src/main.rs"
+
+[[bin]]
+name = "cdeck"
+path = "src/bin/cdeck.rs"
 
 [dependencies]
 ratatui = "0.29"

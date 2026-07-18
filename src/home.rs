@@ -14,6 +14,7 @@ pub fn render(f: &mut Frame, area: Rect, session_count: usize, icon_mode: IconMo
         format!("{} active session{}", session_count, if session_count == 1 { "" } else { "s" })
     };
     let folder = icons::folder(icon_mode);
+    let dim = Style::new().dim();
     let lines = vec![
         Line::from(""),
         Line::from("claude-deck").bold().centered(),
@@ -21,14 +22,17 @@ pub fn render(f: &mut Frame, area: Rect, session_count: usize, icon_mode: IconMo
         Line::from("Welcome back 👋").centered(),
         Line::from("What do you want to work on today?").centered(),
         Line::from(""),
-        Line::from(format!("{}  Ctrl-a  n     new session (pick a folder)", folder)).centered(),
-        Line::from(format!("{}  Ctrl-a  h     back to this Home screen", folder)).centered(),
-        Line::from(""),
-        Line::from("switch  Ctrl-a 1-9 / [ / ]    kill  Ctrl-a x    rename  Ctrl-a r    quit  Ctrl-a q")
-            .style(Style::new().dim())
+        Line::from(format!("{}  Ctrl-a  n   new session      Ctrl-a  o   resume a past one", folder))
             .centered(),
         Line::from(""),
-        Line::from(status).style(Style::new().dim()).centered(),
+        Line::from("─────────  keys  (leader: Ctrl-a, then…)  ─────────").style(dim).centered(),
+        Line::from("n  new session      o  resume past      s  Settings      h  Home").style(dim).centered(),
+        Line::from("1-9 / [ ] / ↑ ↓  switch sessions        !  jump to one waiting on you").style(dim).centered(),
+        Line::from("r  rename      R  restart      p  pin      x  kill      q  quit").style(dim).centered(),
+        Line::from("m  toggle mouse (turn off for native copy/paste)").style(dim).centered(),
+        Line::from("in new-session:  Tab  complete path   ·   Ctrl-r  resume here").style(dim).centered(),
+        Line::from(""),
+        Line::from(status).style(dim).centered(),
     ];
     let block = Block::default().borders(Borders::ALL).title("claude-deck");
     f.render_widget(

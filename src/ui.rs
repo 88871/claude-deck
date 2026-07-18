@@ -13,6 +13,57 @@ use crate::mem;
 use crate::mouse::SIDEBAR_WIDTH;
 use crate::session::SessionState;
 
+/// Truncate `s` to at most `max_chars` Unicode scalar values. If the string
+/// is longer, the last two characters of the output are replaced with "…"
+/// (a single Unicode ellipsis, U+2026) so the total visible length is
+/// `max_chars`.
+pub fn truncate_msg(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        s.to_string()
+    } else {
+        let take = max_chars.saturating_sub(1);
+        let mut out: String = chars[..take].iter().collect();
+        out.push('…');
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_msg;
+
+    #[test]
+    fn no_truncation_when_short_enough() {
+        assert_eq!(truncate_msg("hello", 10), "hello");
+        assert_eq!(truncate_msg("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncates_and_appends_ellipsis() {
+        // "hello world" is 11 chars; max 8 → first 7 + ellipsis
+        assert_eq!(truncate_msg("hello world", 8), "hello w…");
+    }
+
+    #[test]
+    fn truncation_respects_unicode_scalar_values() {
+        // Each emoji is 1 scalar value for our purposes
+        let s = "αβγδεζηθ"; // 8 Greek letters
+        assert_eq!(truncate_msg(s, 6), "αβγδε…");
+    }
+
+    #[test]
+    fn max_chars_one_returns_ellipsis_or_char() {
+        assert_eq!(truncate_msg("ab", 1), "…");
+        assert_eq!(truncate_msg("a", 1), "a");
+    }
+
+    #[test]
+    fn empty_string_unchanged() {
+        assert_eq!(truncate_msg("", 5), "");
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
     // ── Outer horizontal split: sidebar | main ──────────────────────────────
     let chunks = Layout::default()
@@ -83,6 +134,24 @@ pub fn draw(f: &mut Frame, app: &App) {
                     format!(" {}{}", warn_marker, mem_str),
                     mem_style,
                 ));
+            }
+        }
+
+        // Feature B: for WaitingOnYou sessions with a pending message, show a
+        // dim sub-line so the user can see what the session wants without switching.
+        if state == SessionState::WaitingOnYou {
+            if let Some(msg) = app.pending_msg.get(id) {
+                // Reserve 2 chars for the indent ("  "), leaving 22 chars for content.
+                let truncated = truncate_msg(msg, 22);
+                let msg_line = Line::from(vec![
+                    Span::styled(
+                        format!("  {}", truncated),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                let item = ListItem::new(Text::from(vec![Line::from(spans), msg_line]));
+                items.push(item);
+                continue;
             }
         }
 

@@ -97,6 +97,10 @@ pub struct App {
     pub bell_on: bool,
     /// Whether to fire a macOS desktop notification when a session needs attention.
     pub notify_on: bool,
+    /// ntfy.sh topic for phone push notifications. `None` = feature disabled.
+    pub ntfy_topic: Option<String>,
+    /// Last known "what does this session want" message for WaitingOnYou sessions.
+    pub pending_msg: HashMap<String, String>,
     /// Temp settings file path written for `--settings`; removed on quit.
     settings_path: std::path::PathBuf,
     tx: Sender<AppEvent>,
@@ -148,6 +152,10 @@ impl App {
         let notify_on = !args.contains(&"--no-notify".to_string());
         let reap_idle = args.contains(&"--reap-idle".to_string());
 
+        // --ntfy <topic>  OR  env CLAUDE_DECK_NTFY  (arg wins; absent = disabled)
+        let ntfy_env = std::env::var("CLAUDE_DECK_NTFY").ok();
+        let ntfy_topic = crate::notify::ntfy_from(&args, ntfy_env.as_deref());
+
         // --mem-warn <MB>  (default 4096; 0 = disable)
         let mem_warn_kb: Option<u64> = {
             let mb = args.windows(2)
@@ -178,6 +186,8 @@ impl App {
             icons: icons::detect_mode(),
             bell_on,
             notify_on,
+            ntfy_topic,
+            pending_msg: HashMap::new(),
             settings_path,
             tx,
             rx,
@@ -281,6 +291,16 @@ impl App {
                             self.idle_since.remove(&ev.session_id);
                         }
 
+                        // ── Pending message tracking (Feature B) ──────────
+                        if new_state == SessionState::WaitingOnYou {
+                            if let Some(msg) = &ev.message {
+                                self.pending_msg.insert(ev.session_id.clone(), msg.clone());
+                            }
+                        } else {
+                            // Session left WaitingOnYou — clear any pending message.
+                            self.pending_msg.remove(&ev.session_id);
+                        }
+
                         // Fire attention signals on the WaitingOnYou transition edge,
                         // but only when this session is NOT the currently focused one.
                         if new_state == SessionState::WaitingOnYou
@@ -301,6 +321,14 @@ impl App {
                                 }
                                 if self.notify_on {
                                     crate::notify::desktop(&label);
+                                }
+                                // ── Feature A: phone push via ntfy.sh ─────
+                                if let Some(topic) = &self.ntfy_topic {
+                                    crate::notify::push_ntfy(
+                                        topic,
+                                        "claude-deck",
+                                        &format!("{label} needs you"),
+                                    );
                                 }
                             }
                         }
@@ -384,6 +412,7 @@ impl App {
         if let Some(mut pty) = pty_opt {
             let _ = pty.killer.kill();
         }
+        self.pending_msg.remove(&id);
         self.manager.remove(&id);
         // Move focus to a safe state.
         if !self.sessions.is_empty() {
@@ -444,6 +473,7 @@ impl App {
         }
         self.manager.set_state(id, SessionState::Parked);
         self.idle_since.remove(id);
+        self.pending_msg.remove(id);
         self.save_workspace();
     }
 
@@ -983,6 +1013,7 @@ mod tests {
             session_id: "test-session".to_string(),
             event: event.to_string(),
             notification_type: notification_type.map(|s| s.to_string()),
+            message: None,
         }
     }
 

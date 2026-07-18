@@ -10,6 +10,9 @@ pub struct HookEvent {
     pub event: String,
     #[serde(default)]
     pub notification_type: Option<String>,
+    /// The human-readable message from a `Notification` payload, if present.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Bind a `TcpListener` on `127.0.0.1:0` (OS-assigned port), spawn a
@@ -106,9 +109,25 @@ mod tests {
         let e: HookEvent = serde_json::from_str(ups).unwrap();
         assert_eq!(e.session_id, "abc");
         assert_eq!(e.event, "UserPromptSubmit");
+        assert_eq!(e.message, None);
         let notif = r#"{"session_id":"abc","hook_event_name":"Notification","notification_type":"permission_prompt"}"#;
         let n: HookEvent = serde_json::from_str(notif).unwrap();
         assert_eq!(n.notification_type.as_deref(), Some("permission_prompt"));
+        assert_eq!(n.message, None);
+    }
+
+    #[test]
+    fn parses_notification_with_message() {
+        let json = r#"{"session_id":"xyz","hook_event_name":"Notification","notification_type":"permission_prompt","message":"Allow bash command?"}"#;
+        let ev: HookEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(ev.message.as_deref(), Some("Allow bash command?"));
+    }
+
+    #[test]
+    fn message_defaults_to_none_when_absent() {
+        let json = r#"{"session_id":"xyz","hook_event_name":"Stop"}"#;
+        let ev: HookEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(ev.message, None);
     }
 
     #[test]

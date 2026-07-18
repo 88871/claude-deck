@@ -90,8 +90,6 @@ pub struct App {
     pub bell_on: bool,
     /// Whether to fire a macOS desktop notification when a session needs attention.
     pub notify_on: bool,
-    /// Unix socket path used by the hook listener; removed on quit.
-    socket_path: std::path::PathBuf,
     /// Temp settings file path written for `--settings`; removed on quit.
     settings_path: std::path::PathBuf,
     tx: Sender<AppEvent>,
@@ -101,19 +99,18 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        let (socket_path, settings_path) = crate::hooks::paths();
+        let settings_path = crate::hooks::settings_path();
 
         // Start the hook listener — the closure captures a cloned Sender so
         // hooks.rs stays free of the AppEvent type.
         let hook_tx = tx.clone();
-        let _ = crate::hooks::listen(socket_path.clone(), move |ev| {
+        let port = crate::hooks::listen(move |ev| {
             let _ = hook_tx.send(AppEvent::Hook(ev));
-        });
+        }).unwrap_or(0);
 
         // Write the shared hooks settings file so `--settings` sessions can
         // pick it up. Best-effort — if it fails, hooks just won't fire.
-        let socket_str = socket_path.to_string_lossy().into_owned();
-        let _ = crate::hooks::write_settings_file(&settings_path, &socket_str);
+        let _ = crate::hooks::write_settings_file(&settings_path, &port.to_string());
 
         // Parse --no-bell / --no-notify flags from this process's args.
         // This is the TUI path only — __hook is handled before App::new().
@@ -133,7 +130,6 @@ impl App {
             icons: icons::detect_mode(),
             bell_on,
             notify_on,
-            socket_path,
             settings_path,
             tx,
             rx,
@@ -208,8 +204,7 @@ impl App {
             terminal.draw(|f| ui::draw(f, self))?;
         }
 
-        // Best-effort cleanup of temp files on exit.
-        let _ = std::fs::remove_file(&self.socket_path);
+        // Best-effort cleanup of the temp settings file on exit.
         let _ = std::fs::remove_file(&self.settings_path);
 
         Ok(())

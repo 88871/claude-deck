@@ -1,6 +1,5 @@
 use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::net::{TcpListener, TcpStream};
 use serde::Deserialize;
 
 /// A deserialized Claude Code hook payload. Extra JSON fields are ignored.
@@ -13,20 +12,18 @@ pub struct HookEvent {
     pub notification_type: Option<String>,
 }
 
-/// Bind a `UnixListener` on `socket_path`, remove any stale socket first,
-/// and spawn a background thread that calls `on_event` for each incoming
-/// well-formed `HookEvent` payload. Bad/unparseable payloads are dropped
-/// silently. Returns immediately after spawning the thread.
+/// Bind a `TcpListener` on `127.0.0.1:0` (OS-assigned port), spawn a
+/// background accept loop that calls `on_event` for each incoming well-formed
+/// `HookEvent` payload, and return the assigned port number.
 ///
-/// Each accepted connection is handled in its own short-lived thread so that
-/// one slow or hung client cannot stall the accept loop or block other hooks.
-/// `on_event` is wrapped in an `Arc` so it can be shared across worker threads.
+/// Bad/unparseable payloads are dropped silently. Each accepted connection is
+/// handled in its own short-lived thread so that one slow or hung client cannot
+/// stall the accept loop or block other hooks.
 pub fn listen<F: Fn(HookEvent) + Send + Sync + 'static>(
-    socket_path: PathBuf,
     on_event: F,
-) -> std::io::Result<()> {
-    let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path)?;
+) -> std::io::Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
     let on_event = std::sync::Arc::new(on_event);
     std::thread::spawn(move || {
         for conn in listener.incoming() {
@@ -42,24 +39,20 @@ pub fn listen<F: Fn(HookEvent) + Send + Sync + 'static>(
             });
         }
     });
-    Ok(())
+    Ok(port)
 }
 
-/// Returns `(socket_path, settings_path)` — both under `temp_dir()`, named
-/// after this process's PID so multiple instances don't collide.
-pub fn paths() -> (PathBuf, PathBuf) {
+/// Returns the settings file path — under `temp_dir()`, named after this
+/// process's PID so multiple instances don't collide.
+pub fn settings_path() -> std::path::PathBuf {
     let pid = std::process::id();
-    let dir = std::env::temp_dir();
-    (
-        dir.join(format!("claude-deck-{pid}.sock")),
-        dir.join(format!("claude-deck-{pid}-settings.json")),
-    )
+    std::env::temp_dir().join(format!("claude-deck-{pid}-settings.json"))
 }
 
 /// Build the shared settings JSON. Each hook invokes our own binary as a
 /// forwarder using an ABSOLUTE path (hooks don't source shell profiles).
-pub fn settings_json(binary: &str, socket: &str) -> String {
-    let cmd = format!("{binary} __hook {socket}");
+pub fn settings_json(binary: &str, port: &str) -> String {
+    let cmd = format!("{binary} __hook {port}");
     let entry = serde_json::json!([{
         "matcher": "",
         "hooks": [{ "type": "command", "command": cmd }]
@@ -79,19 +72,20 @@ pub fn settings_json(binary: &str, socket: &str) -> String {
 /// The binary path is resolved via `std::env::current_exe()`.
 pub fn write_settings_file(
     settings_path: &std::path::Path,
-    socket: &str,
+    port: &str,
 ) -> std::io::Result<()> {
     let binary = std::env::current_exe()?.to_string_lossy().into_owned();
-    std::fs::write(settings_path, settings_json(&binary, socket))
+    std::fs::write(settings_path, settings_json(&binary, port))
 }
 
-/// `claude-deck __hook <socket>`: read the hook payload from stdin and forward
-/// it to the app's socket. Never fails loudly — a broken forward must not break
-/// the claude session.
-pub fn forward(socket_path: &str) -> std::io::Result<()> {
+/// `claude-deck __hook <port>`: read the hook payload from stdin and forward
+/// it to the app's TCP listener. Never fails loudly — a broken forward must
+/// not break the claude session.
+pub fn forward(port: &str) -> std::io::Result<()> {
     let mut input = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut input);
-    if let Ok(mut stream) = UnixStream::connect(socket_path) {
+    let port_num = port.parse::<u16>().unwrap_or(0);
+    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port_num)) {
         let _ = stream.write_all(&input);
         let _ = stream.flush();
     }
@@ -119,13 +113,13 @@ mod tests {
 
     #[test]
     fn settings_json_registers_hooks_pointing_at_our_binary() {
-        let json = settings_json("/abs/claude-deck", "/tmp/x.sock");
+        let json = settings_json("/abs/claude-deck", "54321");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         for ev in ["SessionStart", "UserPromptSubmit", "Notification", "Stop"] {
             let cmd = v["hooks"][ev][0]["hooks"][0]["command"].as_str().unwrap();
             assert!(cmd.contains("/abs/claude-deck"), "{ev} cmd = {cmd}");
             assert!(cmd.contains("__hook"), "{ev}");
-            assert!(cmd.contains("/tmp/x.sock"), "{ev}");
+            assert!(cmd.contains("54321"), "{ev}");
             assert_eq!(v["hooks"][ev][0]["hooks"][0]["type"], "command");
         }
     }

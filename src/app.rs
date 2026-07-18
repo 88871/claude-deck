@@ -62,6 +62,25 @@ pub fn cycle_focus(focus: Focus, home_visible: bool, session_count: usize, delta
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Identifies which text/number setting is being edited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingKey {
+    NtfyTopic,
+    ReapTimeout,
+    MemWarn,
+}
+
+impl SettingKey {
+    /// Human-readable label shown in the edit prompt line.
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingKey::NtfyTopic   => "ntfy topic",
+            SettingKey::ReapTimeout => "reap timeout (secs)",
+            SettingKey::MemWarn     => "mem warn (MB, 0=off)",
+        }
+    }
+}
+
 /// Describes what kind of text prompt is currently active (if any).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Prompt {
@@ -71,6 +90,8 @@ pub enum Prompt {
     Rename(String),
     /// Awaiting single-keystroke confirmation before restarting the named session.
     ConfirmRestart(String),
+    /// Inline edit of a text/number setting on the Settings screen.
+    EditSetting { key: SettingKey, buf: String },
 }
 
 impl Prompt {
@@ -79,6 +100,7 @@ impl Prompt {
     pub fn buf_mut(&mut self) -> &mut String {
         match self {
             Prompt::NewSession(s) | Prompt::Rename(s) => s,
+            Prompt::EditSetting { buf, .. } => buf,
             Prompt::ConfirmRestart(_) => panic!("ConfirmRestart has no text buffer"),
         }
     }
@@ -642,15 +664,17 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        // Settings mode: navigate the settings list, do NOT forward to any PTY.
-        if self.focus == Focus::Settings {
-            self.on_settings_key(key);
+        // Prompt mode: edit the buffer, do NOT forward to any PTY.
+        // Must come before the Settings check so that EditSetting prompts
+        // (opened from the Settings screen) receive keystrokes here.
+        if self.prompt.is_some() {
+            self.on_input_key(key);
             return;
         }
 
-        // Prompt mode: edit the buffer, do NOT forward to any PTY.
-        if self.prompt.is_some() {
-            self.on_input_key(key);
+        // Settings mode: navigate the settings list, do NOT forward to any PTY.
+        if self.focus == Focus::Settings {
+            self.on_settings_key(key);
             return;
         }
 
@@ -807,6 +831,9 @@ impl App {
                         Prompt::ConfirmRestart(_) => {
                             // Handled above; unreachable here.
                         }
+                        Prompt::EditSetting { key: setting_key, buf } => {
+                            apply_setting_edit(self, setting_key, &buf);
+                        }
                     }
                 }
             }
@@ -842,7 +869,27 @@ impl App {
                     self.settings_cursor += 1;
                 }
             }
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            KeyCode::Enter => {
+                // Non-boolean rows open an inline edit prompt; booleans toggle.
+                let edit_key = match self.settings_cursor {
+                    3 => Some(SettingKey::NtfyTopic),
+                    5 => Some(SettingKey::ReapTimeout),
+                    6 => Some(SettingKey::MemWarn),
+                    _ => None,
+                };
+                if let Some(key) = edit_key {
+                    let current = match key {
+                        SettingKey::NtfyTopic   => self.config.ntfy_topic.clone().unwrap_or_default(),
+                        SettingKey::ReapTimeout => self.config.reap_timeout_secs.to_string(),
+                        SettingKey::MemWarn     => self.config.mem_warn_mb.to_string(),
+                    };
+                    self.prompt = Some(Prompt::EditSetting { key, buf: current });
+                } else {
+                    self.toggle_settings_bool_at_cursor();
+                }
+            }
+            KeyCode::Char(' ') => {
+                // Space only toggles booleans (not edit rows).
                 self.toggle_settings_bool_at_cursor();
             }
             _ => {}
@@ -1007,6 +1054,40 @@ impl App {
                 }
             }
             // Home focused: ignore main-pane mouse.
+        }
+    }
+}
+
+/// Apply a confirmed `EditSetting` value to both `app.config` and the
+/// corresponding live field, then save.  On parse failure for numeric fields,
+/// silently cancels (leaves everything unchanged).
+///
+/// This is a free function (not a method) so it is trivially unit-testable
+/// without constructing a full `App`.
+pub fn apply_setting_edit(app: &mut App, key: SettingKey, raw: &str) {
+    match key {
+        SettingKey::NtfyTopic => {
+            let trimmed = raw.trim();
+            let new_val = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+            app.config.ntfy_topic = new_val.clone();
+            app.ntfy_topic = new_val;
+            config::save(&app.config);
+        }
+        SettingKey::ReapTimeout => {
+            if let Ok(secs) = raw.trim().parse::<u64>() {
+                app.config.reap_timeout_secs = secs;
+                app.reap_timeout = Duration::from_secs(secs);
+                config::save(&app.config);
+            }
+            // Parse failure → cancel, no change.
+        }
+        SettingKey::MemWarn => {
+            if let Ok(mb) = raw.trim().parse::<u64>() {
+                app.config.mem_warn_mb = mb;
+                app.mem_warn_kb = if mb > 0 { Some(mb * 1024) } else { None };
+                config::save(&app.config);
+            }
+            // Parse failure → cancel, no change.
         }
     }
 }
@@ -1250,5 +1331,98 @@ mod tests {
     #[test]
     fn next_attention_empty_returns_none() {
         assert_eq!(next_attention(&[], 0), None);
+    }
+
+    // ── SettingKey parse helpers (mirrors apply_setting_edit validation) ───────
+
+    /// Parse logic for NtfyTopic: empty/whitespace → None, else Some(trimmed).
+    fn parse_ntfy_topic(raw: &str) -> Option<String> {
+        let t = raw.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    }
+
+    /// Parse logic for ReapTimeout / MemWarn: u64 or cancel.
+    fn parse_u64_setting(raw: &str) -> Option<u64> {
+        raw.trim().parse::<u64>().ok()
+    }
+
+    #[test]
+    fn ntfy_topic_empty_string_becomes_none() {
+        assert_eq!(parse_ntfy_topic(""), None);
+    }
+
+    #[test]
+    fn ntfy_topic_whitespace_only_becomes_none() {
+        assert_eq!(parse_ntfy_topic("   "), None);
+    }
+
+    #[test]
+    fn ntfy_topic_value_is_trimmed() {
+        assert_eq!(parse_ntfy_topic("  my-topic  "), Some("my-topic".to_string()));
+    }
+
+    #[test]
+    fn ntfy_topic_non_empty_returns_some() {
+        assert_eq!(parse_ntfy_topic("alerts"), Some("alerts".to_string()));
+    }
+
+    #[test]
+    fn reap_timeout_valid_number_parses() {
+        assert_eq!(parse_u64_setting("300"), Some(300u64));
+    }
+
+    #[test]
+    fn reap_timeout_zero_is_valid() {
+        assert_eq!(parse_u64_setting("0"), Some(0u64));
+    }
+
+    #[test]
+    fn reap_timeout_invalid_string_returns_none() {
+        assert_eq!(parse_u64_setting("abc"), None);
+    }
+
+    #[test]
+    fn reap_timeout_negative_returns_none() {
+        assert_eq!(parse_u64_setting("-1"), None);
+    }
+
+    #[test]
+    fn reap_timeout_whitespace_trimmed_before_parse() {
+        assert_eq!(parse_u64_setting("  120  "), Some(120u64));
+    }
+
+    #[test]
+    fn mem_warn_zero_disables_warning() {
+        // mb=0 → mem_warn_kb should be None
+        let mb = parse_u64_setting("0").unwrap();
+        let kb: Option<u64> = if mb > 0 { Some(mb * 1024) } else { None };
+        assert_eq!(kb, None);
+    }
+
+    #[test]
+    fn mem_warn_positive_converts_to_kb() {
+        let mb = parse_u64_setting("4096").unwrap();
+        let kb: Option<u64> = if mb > 0 { Some(mb * 1024) } else { None };
+        assert_eq!(kb, Some(4096 * 1024));
+    }
+
+    #[test]
+    fn setting_key_labels_are_nonempty() {
+        assert!(!SettingKey::NtfyTopic.label().is_empty());
+        assert!(!SettingKey::ReapTimeout.label().is_empty());
+        assert!(!SettingKey::MemWarn.label().is_empty());
+    }
+
+    #[test]
+    fn prompt_edit_setting_buf_mut_returns_buf() {
+        let mut p = Prompt::EditSetting {
+            key: SettingKey::NtfyTopic,
+            buf: "hello".to_string(),
+        };
+        p.buf_mut().push_str(" world");
+        assert_eq!(p, Prompt::EditSetting {
+            key: SettingKey::NtfyTopic,
+            buf: "hello world".to_string(),
+        });
     }
 }

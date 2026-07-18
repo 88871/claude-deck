@@ -117,6 +117,13 @@ pub fn draw(f: &mut Frame, app: &App) {
         } else {
             f.render_widget(Paragraph::new(confirm_msg), inner);
         }
+    } else if matches!(&app.prompt, Some(Prompt::EditSetting { .. })) {
+        // EditSetting: render the settings view with an inline edit line at the bottom.
+        // We draw inside the main block directly so the settings pane is behind the prompt.
+        let main_area = chunks[1];
+        f.render_widget(&main_block, main_area);
+        let inner = main_block.inner(main_area);
+        draw_settings_view_with_edit(f, inner, app);
     } else if app.prompt.is_some() {
         let main_area = chunks[1];
         let inner = main_block.inner(main_area);
@@ -126,7 +133,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         let (prefix, buf) = match &app.prompt {
             Some(Prompt::NewSession(s)) => ("new session path: ", s.as_str()),
             Some(Prompt::Rename(s))     => ("rename session: ",   s.as_str()),
-            Some(Prompt::ConfirmRestart(_)) | None => ("", ""),
+            Some(Prompt::ConfirmRestart(_)) | Some(Prompt::EditSetting { .. }) | None => ("", ""),
         };
 
         if inner.height > 1 {
@@ -378,12 +385,11 @@ fn draw_settings_view(f: &mut Frame, area: Rect, app: &App) {
 
     // Header line.
     let header = Line::from(vec![Span::styled(
-        "Settings — ↑/↓ move · Enter/Space toggle · Esc back",
+        "Settings — ↑/↓ move · Enter toggle/edit · Space toggle · Esc back",
         Style::default().fg(Color::DarkGray),
     )]);
 
     let rows = settings_rows(app);
-    let usable_h = inner.height as usize;
 
     // Split inner: header (1 row) + list (remaining).
     if inner.height < 2 {
@@ -398,8 +404,67 @@ fn draw_settings_view(f: &mut Frame, area: Rect, app: &App) {
 
     f.render_widget(Paragraph::new(header), vsplit[0]);
 
-    // Build list items.
-    let label_col_width = inner.width.saturating_sub(12).max(8) as usize;
+    render_settings_list(f, vsplit[1], app, &rows);
+}
+
+/// Render the settings view with an active EditSetting prompt at the bottom.
+/// Called when `app.prompt` is `Some(Prompt::EditSetting { .. })`.
+fn draw_settings_view_with_edit(f: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 {
+        return;
+    }
+
+    let (setting_key, buf) = match &app.prompt {
+        Some(Prompt::EditSetting { key, buf }) => (*key, buf.as_str()),
+        _ => return,
+    };
+
+    // Header line.
+    let header = Line::from(vec![Span::styled(
+        "Settings — ↑/↓ move · Enter toggle/edit · Space toggle · Esc back",
+        Style::default().fg(Color::DarkGray),
+    )]);
+
+    let rows = settings_rows(app);
+
+    // Layout: header | list | edit line
+    if area.height < 3 {
+        // Too small: just show the edit line.
+        let edit_text = format!("edit {}: {}_", setting_key.label(), buf);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(edit_text, Style::default().fg(Color::Yellow)),
+            ])),
+            area,
+        );
+        return;
+    }
+
+    let vsplit = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),  // header
+            Constraint::Min(1),     // list
+            Constraint::Length(1),  // edit line
+        ])
+        .split(area);
+
+    f.render_widget(Paragraph::new(header), vsplit[0]);
+    render_settings_list(f, vsplit[1], app, &rows);
+
+    // Edit line at the bottom.
+    let edit_text = format!("edit {}: {}_", setting_key.label(), buf);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(edit_text, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ])),
+        vsplit[2],
+    );
+}
+
+/// Shared helper: render the settings list rows into `area`.
+fn render_settings_list(f: &mut Frame, area: Rect, app: &App, rows: &[(&'static str, String)]) {
+    let label_col_width = area.width.saturating_sub(12).max(8) as usize;
     let mut items: Vec<ListItem> = Vec::new();
     for (i, (label, value)) in rows.iter().enumerate() {
         let is_cursor = i == app.settings_cursor;
@@ -419,9 +484,6 @@ fn draw_settings_view(f: &mut Frame, area: Rect, app: &App) {
         };
         items.push(ListItem::new(Line::from(vec![Span::styled(row_text, style)])));
     }
-
-    // Clamp list to available height.
-    let list_h = usable_h.saturating_sub(1); // minus header row
-    let _ = list_h; // ratatui List handles its own scrolling if needed
-    f.render_widget(List::new(items), vsplit[1]);
+    f.render_widget(List::new(items), area);
 }
+

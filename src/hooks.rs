@@ -17,21 +17,29 @@ pub struct HookEvent {
 /// and spawn a background thread that calls `on_event` for each incoming
 /// well-formed `HookEvent` payload. Bad/unparseable payloads are dropped
 /// silently. Returns immediately after spawning the thread.
-pub fn listen<F: Fn(HookEvent) + Send + 'static>(
+///
+/// Each accepted connection is handled in its own short-lived thread so that
+/// one slow or hung client cannot stall the accept loop or block other hooks.
+/// `on_event` is wrapped in an `Arc` so it can be shared across worker threads.
+pub fn listen<F: Fn(HookEvent) + Send + Sync + 'static>(
     socket_path: PathBuf,
     on_event: F,
 ) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
+    let on_event = std::sync::Arc::new(on_event);
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut stream) = conn else { continue };
-            let mut buf = Vec::new();
-            if std::io::Read::read_to_end(&mut stream, &mut buf).is_ok() {
-                if let Ok(ev) = serde_json::from_slice::<HookEvent>(&buf) {
-                    on_event(ev);
+            let handler = std::sync::Arc::clone(&on_event);
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if std::io::Read::read_to_end(&mut stream, &mut buf).is_ok() {
+                    if let Ok(ev) = serde_json::from_slice::<HookEvent>(&buf) {
+                        handler(ev);
+                    }
                 }
-            }
+            });
         }
     });
     Ok(())

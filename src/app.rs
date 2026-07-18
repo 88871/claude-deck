@@ -226,9 +226,10 @@ impl App {
         self.manager.create_with_id(id.clone(), cwd.clone());
         match pty::spawn(&path, &cwd, rows, cols, id.clone(), &settings_str, self.tx.clone()) {
             Ok(pty) => {
-                // State will be driven by SessionStart hook; set Running as
-                // a fallback in case hooks aren't available.
-                self.manager.set_state(&id, SessionState::Running);
+                // State starts as Starting (from create_with_id) and is driven
+                // entirely by hooks (SessionStart → Starting, UserPromptSubmit →
+                // Running, etc.). No eager Running here — that caused a visible
+                // flicker: Running → Starting → Running on every launch.
                 let new_index = self.sessions.len();
                 self.sessions.push((id, pty));
                 self.focus = Focus::Session(new_index); // new session becomes focused

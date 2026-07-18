@@ -7,16 +7,21 @@ pub fn bell() {
     let _ = out.flush();
 }
 
+/// Escape a session label for use inside an AppleScript double-quoted string.
+/// Backslashes are escaped first, then double-quotes, so neither can break the
+/// string literal.
+pub fn escape_label(label: &str) -> String {
+    label.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Spawn a detached `osascript` process that fires a macOS desktop notification
 /// for the given session label. Errors and non-macOS targets are silently
 /// ignored.
 ///
-/// `label` is sanitised so that any `"` or `\` characters cannot break the
-/// AppleScript string literal.
+/// `label` is sanitised via `escape_label` so that any `"` or `\` characters
+/// cannot break the AppleScript string literal.
 pub fn desktop(label: &str) {
-    // Escape backslashes first, then double-quotes, to produce a safe
-    // AppleScript string literal.
-    let safe = label.replace('\\', "\\\\").replace('"', "\\\"");
+    let safe = escape_label(label);
     let script = format!(
         "display notification \"{safe} needs you\" with title \"claude-deck\""
     );
@@ -29,25 +34,26 @@ pub fn desktop(label: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::escape_label;
+
     #[test]
-    fn escapes_double_quotes_in_label() {
-        // A label with quotes must not break the AppleScript string.
-        // We can't easily test the actual osascript invocation, but we can
-        // verify the escaping logic by reconstructing the script string.
-        let label = r#"my "project""#;
-        let safe = label.replace('\\', "\\\\").replace('"', "\\\"");
-        assert_eq!(safe, r#"my \"project\""#);
-        // The script must contain the escaped label.
-        let script = format!(
-            "display notification \"{safe} needs you\" with title \"claude-deck\""
-        );
-        assert!(script.contains(r#"my \"project\""#));
+    fn escape_label_escapes_double_quotes() {
+        assert_eq!(escape_label(r#"my "project""#), r#"my \"project\""#);
     }
 
     #[test]
-    fn escapes_backslashes_in_label() {
-        let label = r#"C:\Users\proj"#;
-        let safe = label.replace('\\', "\\\\").replace('"', "\\\"");
-        assert_eq!(safe, r#"C:\\Users\\proj"#);
+    fn escape_label_escapes_backslashes() {
+        assert_eq!(escape_label(r#"C:\Users\proj"#), r#"C:\\Users\\proj"#);
+    }
+
+    #[test]
+    fn escape_label_escapes_backslash_before_quote() {
+        // A label like `foo\"bar` → `foo\\\"bar` (backslash then quote both escaped)
+        assert_eq!(escape_label(r#"foo\"bar"#), r#"foo\\\"bar"#);
+    }
+
+    #[test]
+    fn escape_label_plain_label_unchanged() {
+        assert_eq!(escape_label("my-project"), "my-project");
     }
 }

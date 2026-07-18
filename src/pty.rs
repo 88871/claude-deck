@@ -15,6 +15,9 @@ pub struct PtySession {
     /// doesn't expose it.  Captured **before** the child moves to the waiter
     /// thread so the waiter's `move` closure doesn't take it first.
     pub pid: Option<u32>,
+    /// How many rows the user has scrolled back from the live view.
+    /// 0 = live (bottom of output); positive = scrolled back that many rows.
+    pub scroll: usize,
 }
 
 /// Resolve the path to the `claude` binary.
@@ -78,7 +81,7 @@ pub fn spawn(
 
     let mut reader = pair.master.try_clone_reader().map_err(to_io)?;
     let writer = pair.master.take_writer().map_err(to_io)?;
-    let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+    let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 5000)));
 
     // Reader thread: feed the vt100 parser and wake the UI on each chunk.
     let read_parser = parser.clone();
@@ -103,7 +106,7 @@ pub fn spawn(
         let _ = tx.send(AppEvent::Exited { id, clean });
     });
 
-    Ok(PtySession { writer, master: pair.master, killer, parser, pid })
+    Ok(PtySession { writer, master: pair.master, killer, parser, pid, scroll: 0 })
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {

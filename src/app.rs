@@ -30,6 +30,20 @@ pub enum Focus {
     ResumePicker,
 }
 
+// ── Pure scroll-offset helper (testable without a live PTY) ──────────────────
+
+/// Adjust a scrollback `current` offset up or down by `step` rows.
+///
+/// - `up = true`  → increase (scroll towards history), clamped to `max`.
+/// - `up = false` → decrease (scroll towards live), saturating at 0.
+pub fn scroll_offset(current: usize, up: bool, step: usize, max: usize) -> usize {
+    if up {
+        current.saturating_add(step).min(max)
+    } else {
+        current.saturating_sub(step)
+    }
+}
+
 // ── Pure focus-transition helpers (testable without a live PTY) ──────────────
 
 /// Build the ordered list of visible "slots" for cycling:
@@ -896,6 +910,11 @@ impl App {
                     self.idle_since.remove(id);
                 }
                 if let Some((_, Some(pty))) = self.sessions.get_mut(i) {
+                    // Snap back to live view on any keystroke.
+                    if pty.scroll != 0 {
+                        pty.scroll = 0;
+                        pty.parser.lock().unwrap().set_scrollback(0);
+                    }
                     let _ = pty.writer.write_all(&bytes);
                     let _ = pty.writer.flush();
                 }
@@ -1269,9 +1288,25 @@ impl App {
             }
         } else {
             // ── Main pane region ──────────────────────────────────────────────
-            // Only forward when a session is focused; ignore for Home and Settings.
+            // Only act when a session is focused; ignore for Home and Settings.
             if let Focus::Session(i) = self.focus {
-                // Translate terminal coordinates to 1-based pane-interior coords.
+                // Intercept wheel events for scrollback — do NOT forward to PTY.
+                match m.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        const SCROLL_STEP: usize = 3;
+                        const SCROLL_MAX: usize = 5000;
+                        if let Some((_, Some(pty))) = self.sessions.get_mut(i) {
+                            let up = m.kind == MouseEventKind::ScrollUp;
+                            pty.scroll = scroll_offset(pty.scroll, up, SCROLL_STEP, SCROLL_MAX);
+                            pty.parser.lock().unwrap().set_scrollback(pty.scroll);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+
+                // Non-wheel: translate terminal coordinates to 1-based pane-interior
+                // coords and forward to the PTY as SGR mouse sequences.
                 // The pane interior starts after the 26-wide sidebar and the
                 // main block's left border (1 cell), and below the top border
                 // (1 cell at row 0).
@@ -1742,6 +1777,42 @@ mod tests {
     #[test]
     fn next_attention_empty_returns_none() {
         assert_eq!(next_attention(&[], 0), None);
+    }
+
+    // ── scroll_offset ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn scroll_offset_up_increases_by_step() {
+        assert_eq!(scroll_offset(0, true, 3, 5000), 3);
+        assert_eq!(scroll_offset(3, true, 3, 5000), 6);
+    }
+
+    #[test]
+    fn scroll_offset_up_clamps_to_max() {
+        assert_eq!(scroll_offset(4999, true, 3, 5000), 5000);
+        assert_eq!(scroll_offset(5000, true, 3, 5000), 5000);
+    }
+
+    #[test]
+    fn scroll_offset_down_decreases_by_step() {
+        assert_eq!(scroll_offset(9, false, 3, 5000), 6);
+        assert_eq!(scroll_offset(3, false, 3, 5000), 0);
+    }
+
+    #[test]
+    fn scroll_offset_down_saturates_at_zero() {
+        assert_eq!(scroll_offset(1, false, 3, 5000), 0);
+        assert_eq!(scroll_offset(0, false, 3, 5000), 0);
+    }
+
+    #[test]
+    fn scroll_offset_up_exact_max() {
+        assert_eq!(scroll_offset(0, true, 5000, 5000), 5000);
+    }
+
+    #[test]
+    fn scroll_offset_step_larger_than_current_saturates_at_zero() {
+        assert_eq!(scroll_offset(2, false, 10, 5000), 0);
     }
 
     // ── SettingKey parse helpers (mirrors apply_setting_edit validation) ───────

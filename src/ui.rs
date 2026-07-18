@@ -76,7 +76,18 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_sidebar(f, app, chunks[0]);
 
     // ── Main pane: split vertically for optional input line ──────────────────
-    let main_block = Block::default().borders(Borders::ALL).title("claude-deck");
+    // Choose the main block title: show a scrollback indicator when the focused
+    // session is scrolled back from the live view.
+    let scrollback_active = if let Focus::Session(i) = app.focus {
+        app.sessions.get(i)
+            .and_then(|(_, pty_opt)| pty_opt.as_ref())
+            .map(|pty| pty.scroll > 0)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let main_title = if scrollback_active { "claude-deck  -- SCROLLBACK --" } else { "claude-deck" };
+    let main_block = Block::default().borders(Borders::ALL).title(main_title);
 
     if let Some(Prompt::ConfirmRestart(ref id)) = app.prompt {
         // Confirmation prompt: render the current session behind it, with a

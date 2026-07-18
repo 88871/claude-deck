@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph},
@@ -9,6 +9,7 @@ use tui_term::widget::PseudoTerminal;
 use crate::app::{App, Focus, Prompt};
 use crate::home;
 use crate::icons;
+use crate::mem;
 use crate::mouse::SIDEBAR_WIDTH;
 use crate::session::SessionState;
 
@@ -37,7 +38,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 
     // Session rows.
-    for (i, (id, _pty)) in app.sessions.iter().enumerate() {
+    for (i, (id, pty_opt)) in app.sessions.iter().enumerate() {
         let session_info = app.manager.get(id);
         let (label, state, pinned) = session_info
             .map(|s| (s.label.clone(), s.state, s.pinned))
@@ -61,10 +62,31 @@ pub fn draw(f: &mut Frame, app: &App) {
         // Prepend a pin marker for pinned sessions.
         let pin_prefix = if pinned { "* " } else { "" };
 
-        items.push(ListItem::new(Line::from(vec![
+        // Build spans for this row.
+        let mut spans = vec![
             Span::styled(g, glyph_style),
             Span::styled(format!(" {}{}", pin_prefix, label), label_style),
-        ])));
+        ];
+
+        // For live sessions: show RSS + optional warning marker.
+        if pty_opt.is_some() {
+            if let Some(&rss_kb) = app.rss.get(id) {
+                let mem_str = mem::fmt_kb(rss_kb);
+                let over_warn = app.mem_warn_kb.map(|warn| rss_kb >= warn).unwrap_or(false);
+                let mem_style = if over_warn {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let warn_marker = if over_warn { "! " } else { "" };
+                spans.push(Span::styled(
+                    format!(" {}{}", warn_marker, mem_str),
+                    mem_style,
+                ));
+            }
+        }
+
+        items.push(ListItem::new(Line::from(spans)));
     }
 
     if items.is_empty() {
@@ -79,7 +101,47 @@ pub fn draw(f: &mut Frame, app: &App) {
     // ── Main pane: split vertically for optional input line ──────────────────
     let main_block = Block::default().borders(Borders::ALL).title("claude-deck");
 
-    if app.prompt.is_some() {
+    if let Some(Prompt::ConfirmRestart(ref id)) = app.prompt {
+        // Confirmation prompt: render the current session behind it, with a
+        // single-line confirmation message at the bottom.
+        let main_area = chunks[1];
+        let inner = main_block.inner(main_area);
+        f.render_widget(main_block, main_area);
+
+        // Find a human-readable label for the session being restarted.
+        let label = app.manager.get(id)
+            .map(|s| s.label.clone())
+            .unwrap_or_else(|| id[..8.min(id.len())].to_string());
+
+        let confirm_msg = format!(
+            "restart {}? in-flight work will be lost — press y to confirm, any other key cancels",
+            label
+        );
+
+        if inner.height > 1 {
+            let vsplit = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(inner);
+
+            // Show the live session behind the prompt.
+            if let Focus::Session(i) = app.focus {
+                if let Some((_, Some(pty))) = app.sessions.get(i) {
+                    let parser = pty.parser.lock().unwrap();
+                    f.render_widget(PseudoTerminal::new(parser.screen()), vsplit[0]);
+                }
+            }
+
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(confirm_msg, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                ])),
+                vsplit[1],
+            );
+        } else {
+            f.render_widget(Paragraph::new(confirm_msg), inner);
+        }
+    } else if app.prompt.is_some() {
         let main_area = chunks[1];
         let inner = main_block.inner(main_area);
         f.render_widget(main_block, main_area);
@@ -88,7 +150,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         let (prefix, buf) = match &app.prompt {
             Some(Prompt::NewSession(s)) => ("new session path: ", s.as_str()),
             Some(Prompt::Rename(s))     => ("rename session: ",   s.as_str()),
-            None => ("", ""),
+            Some(Prompt::ConfirmRestart(_)) | None => ("", ""),
         };
 
         if inner.height > 1 {
@@ -109,7 +171,11 @@ pub fn draw(f: &mut Frame, app: &App) {
                             f.render_widget(PseudoTerminal::new(parser.screen()), vsplit[0]);
                         }
                         _ => {
-                            f.render_widget(Paragraph::new("parked"), vsplit[0]);
+                            f.render_widget(
+                                Paragraph::new("parked to save memory — resuming…")
+                                    .alignment(Alignment::Center),
+                                vsplit[0],
+                            );
                         }
                     }
                 }
@@ -145,9 +211,11 @@ pub fn draw(f: &mut Frame, app: &App) {
                         );
                     }
                     Some((_, None)) => {
-                        // Parked session: show a placeholder.
+                        // Parked session: show a transient placeholder while resuming.
                         f.render_widget(
-                            Paragraph::new("parked").block(main_block),
+                            Paragraph::new("parked to save memory — resuming…")
+                                .alignment(Alignment::Center)
+                                .block(main_block),
                             chunks[1],
                         );
                     }

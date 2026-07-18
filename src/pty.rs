@@ -52,6 +52,7 @@ pub fn spawn(
     id: String,
     settings_path: &str,
     tx: Sender<AppEvent>,
+    resume: bool,
 ) -> std::io::Result<PtySession> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -63,7 +64,11 @@ pub fn spawn(
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("LANG", "en_US.UTF-8");
-    cmd.args(["--session-id", &id, "--settings", settings_path]);
+    if resume {
+        cmd.args(["--resume", &id, "--settings", settings_path]);
+    } else {
+        cmd.args(["--session-id", &id, "--settings", settings_path]);
+    }
 
     let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
     drop(pair.slave);

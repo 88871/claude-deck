@@ -63,17 +63,19 @@ pub enum Prompt {
     NewSession(String),
     /// The user is typing a new label for the focused session.
     Rename(String),
+    /// Awaiting single-keystroke confirmation before restarting the named session.
+    ConfirmRestart(String),
 }
 
 impl Prompt {
-    /// Returns a mutable reference to the inner buffer.
+    /// Returns a mutable reference to the inner text buffer.
+    /// Not applicable to `ConfirmRestart` (no text field) — panics if called on it.
     pub fn buf_mut(&mut self) -> &mut String {
         match self {
             Prompt::NewSession(s) | Prompt::Rename(s) => s,
+            Prompt::ConfirmRestart(_) => panic!("ConfirmRestart has no text buffer"),
         }
     }
-
-
 }
 
 pub struct App {
@@ -288,7 +290,7 @@ impl App {
         let id = uuid::Uuid::new_v4().to_string();
         let settings_str = self.settings_path.to_string_lossy().into_owned();
         self.manager.create_with_id(id.clone(), cwd.clone());
-        match pty::spawn(&path, &cwd, rows, cols, id.clone(), &settings_str, self.tx.clone()) {
+        match pty::spawn(&path, &cwd, rows, cols, id.clone(), &settings_str, self.tx.clone(), false) {
             Ok(pty) => {
                 // State starts as Starting (from create_with_id) and is driven
                 // entirely by hooks (SessionStart → Starting, UserPromptSubmit →
@@ -330,6 +332,7 @@ impl App {
         };
         if let Some(i) = next_attention(&states, from) {
             self.focus = Focus::Session(i);
+            self.maybe_revive_focused();
             self.sync_focus_size();
         }
     }
@@ -354,6 +357,17 @@ impl App {
             // No sessions, Home hidden — show Home again as a safety net.
             self.home_visible = true;
             self.focus = Focus::Home;
+        }
+    }
+
+    /// If the currently focused session is parked, revive it immediately.
+    /// Call this right after changing `self.focus` to a session slot.
+    fn maybe_revive_focused(&mut self) {
+        if let Focus::Session(i) = self.focus {
+            let is_parked = self.sessions.get(i).map(|(_, pty)| pty.is_none()).unwrap_or(false);
+            if is_parked {
+                self.revive_session(i);
+            }
         }
     }
 
@@ -391,6 +405,45 @@ impl App {
         }
         self.manager.set_state(id, SessionState::Parked);
         self.idle_since.remove(id);
+    }
+
+    /// Revive the session at `idx` if it is currently parked (`None` pty).
+    ///
+    /// Uses `--resume <id>` so the conversation is restored.  Clears any idle /
+    /// warned state for the session and syncs the PTY to the current pane size.
+    /// No-op if the session is already live or the index is out of bounds.
+    pub fn revive_session(&mut self, idx: usize) {
+        let Some(path) = self.claude_path.clone() else { return };
+        // Only act on parked (None) slots.
+        let is_parked = self.sessions.get(idx).map(|(_, pty)| pty.is_none()).unwrap_or(false);
+        if !is_parked { return; }
+
+        let (id, cwd) = {
+            let (id, _) = &self.sessions[idx];
+            let cwd = self.manager.get(id).map(|s| s.cwd.clone())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            (id.clone(), cwd)
+        };
+        let settings_str = self.settings_path.to_string_lossy().into_owned();
+
+        // Get current pane size for the new PTY.
+        let (rows, cols) = crossterm::terminal::size()
+            .map(|(w, h)| pane_dims(w, h))
+            .unwrap_or((24, 80));
+
+        match pty::spawn(&path, &cwd, rows, cols, id.clone(), &settings_str, self.tx.clone(), true) {
+            Ok(pty) => {
+                self.sessions[idx].1 = Some(pty);
+                self.manager.set_state(&id, SessionState::Starting);
+                self.idle_since.remove(&id);
+                self.warned.remove(&id);
+                // Sync size now that the PTY is live.
+                self.sync_focus_size();
+            }
+            Err(_) => {
+                self.manager.set_state(&id, SessionState::Error);
+            }
+        }
     }
 
     /// Tick handler: measure RSS for every live session, fire memory warnings
@@ -507,19 +560,31 @@ impl App {
                         Focus::Session(_) => self.kill_focused(),
                     }
                 }
+                KeyCode::Char('R') => {
+                    // Confirmed manual restart: only valid when focused on a LIVE session.
+                    if let Focus::Session(i) = self.focus {
+                        if let Some((id, Some(_pty))) = self.sessions.get(i) {
+                            self.prompt = Some(Prompt::ConfirmRestart(id.clone()));
+                        }
+                    }
+                    // Parked or Home → no-op
+                }
                 KeyCode::Char(c @ '1'..='9') => {
                     let i = (c as u8 - b'1') as usize;
                     if i < self.sessions.len() {
                         self.focus = Focus::Session(i);
+                        self.maybe_revive_focused();
                         self.sync_focus_size();
                     }
                 }
                 KeyCode::Char('[') => {
                     self.focus = cycle_focus(self.focus, self.home_visible, self.sessions.len(), -1);
+                    self.maybe_revive_focused();
                     self.sync_focus_size();
                 }
                 KeyCode::Char(']') => {
                     self.focus = cycle_focus(self.focus, self.home_visible, self.sessions.len(), 1);
+                    self.maybe_revive_focused();
                     self.sync_focus_size();
                 }
                 KeyCode::Char('!') => {
@@ -561,6 +626,18 @@ impl App {
 
     /// Handle a key while in prompt mode.
     fn on_input_key(&mut self, key: KeyEvent) {
+        // ConfirmRestart is a single-keystroke confirm — handle it before the
+        // generic text-buffer path so we never touch buf_mut on this variant.
+        if let Some(Prompt::ConfirmRestart(id)) = &self.prompt {
+            let id = id.clone();
+            self.prompt = None; // clear first (restart path re-enters on success)
+            if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('Y') {
+                self.restart_session(&id);
+            }
+            // Any other key: prompt already cleared → cancelled.
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.prompt = None;
@@ -587,6 +664,9 @@ impl App {
                             }
                             // Empty buffer → cancel without changing the name.
                         }
+                        Prompt::ConfirmRestart(_) => {
+                            // Handled above; unreachable here.
+                        }
                     }
                 }
             }
@@ -601,6 +681,48 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Kill the live PTY for `id` and respawn with `--resume`, keeping the
+    /// session in the same slot.  State resets to Starting.  Clears RSS/warned.
+    ///
+    /// Called only from the confirmed `Ctrl-a R` path.
+    fn restart_session(&mut self, id: &str) {
+        let Some(path) = self.claude_path.clone() else { return };
+
+        // Find the session index.
+        let Some(idx) = self.sessions.iter().position(|(sid, _)| sid == id) else { return };
+
+        // Kill the live PTY (best-effort).
+        if let Some((_, pty_slot)) = self.sessions.get_mut(idx) {
+            if let Some(mut pty) = pty_slot.take() {
+                let _ = pty.killer.kill();
+            }
+        }
+
+        // Clear memory state for this id.
+        self.rss.remove(id);
+        self.warned.remove(id);
+        self.idle_since.remove(id);
+
+        // Respawn with --resume.
+        let cwd = self.manager.get(id).map(|s| s.cwd.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let settings_str = self.settings_path.to_string_lossy().into_owned();
+        let (rows, cols) = crossterm::terminal::size()
+            .map(|(w, h)| pane_dims(w, h))
+            .unwrap_or((24, 80));
+        let id_owned = id.to_string();
+        match pty::spawn(&path, &cwd, rows, cols, id_owned.clone(), &settings_str, self.tx.clone(), true) {
+            Ok(pty) => {
+                self.sessions[idx].1 = Some(pty);
+                self.manager.set_state(&id_owned, SessionState::Starting);
+                self.sync_focus_size();
+            }
+            Err(_) => {
+                self.manager.set_state(&id_owned, SessionState::Error);
+            }
         }
     }
 
@@ -623,16 +745,19 @@ impl App {
                     if let Some(new_focus) = mouse::sidebar_hit(m.row, self.home_visible, self.sessions.len()) {
                         self.focus = new_focus;
                         if matches!(new_focus, Focus::Session(_)) {
+                            self.maybe_revive_focused();
                             self.sync_focus_size();
                         }
                     }
                 }
                 MouseEventKind::ScrollUp => {
                     self.focus = cycle_focus(self.focus, self.home_visible, self.sessions.len(), -1);
+                    self.maybe_revive_focused();
                     self.sync_focus_size();
                 }
                 MouseEventKind::ScrollDown => {
                     self.focus = cycle_focus(self.focus, self.home_visible, self.sessions.len(), 1);
+                    self.maybe_revive_focused();
                     self.sync_focus_size();
                 }
                 _ => {}

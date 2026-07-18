@@ -8,6 +8,7 @@ use ratatui::{
 use tui_term::widget::PseudoTerminal;
 use crate::app::{App, Focus};
 use crate::home;
+use crate::mouse::SIDEBAR_WIDTH;
 use crate::session::SessionState;
 
 fn glyph(state: SessionState) -> &'static str {
@@ -27,7 +28,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     // ── Outer horizontal split: sidebar | main ──────────────────────────────
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(26), Constraint::Min(0)])
+        .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
         .split(f.area());
 
     // ── Sidebar ─────────────────────────────────────────────────────────────

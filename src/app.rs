@@ -3,10 +3,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crate::pty::{self, PtySession};
 use crate::session::{SessionManager, SessionState};
-use crate::{keys, ui, Tui};
+use crate::{keys, mouse, ui, Tui};
 
 pub enum AppEvent {
     Input(Event),
@@ -101,6 +101,7 @@ impl App {
             match self.rx.recv() {
                 Ok(AppEvent::Input(Event::Key(k))) if k.kind == KeyEventKind::Press => self.on_key(k),
                 Ok(AppEvent::Input(Event::Resize(w, h))) => self.on_resize(w, h),
+                Ok(AppEvent::Input(Event::Mouse(m))) => self.on_mouse(m),
                 Ok(AppEvent::Input(_)) => {}
                 Ok(AppEvent::Output) => {}
                 Ok(AppEvent::Exited { id, clean }) => {
@@ -296,12 +297,73 @@ impl App {
             }
         }
     }
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        if m.column < mouse::SIDEBAR_WIDTH {
+            // ── Sidebar region ────────────────────────────────────────────────
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(new_focus) = mouse::sidebar_hit(m.row, self.home_visible, self.sessions.len()) {
+                        self.focus = new_focus;
+                        if matches!(new_focus, Focus::Session(_)) {
+                            self.sync_focus_size();
+                        }
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    self.focus = cycle_focus(self.focus, self.home_visible, self.sessions.len(), -1);
+                    self.sync_focus_size();
+                }
+                MouseEventKind::ScrollDown => {
+                    self.focus = cycle_focus(self.focus, self.home_visible, self.sessions.len(), 1);
+                    self.sync_focus_size();
+                }
+                _ => {}
+            }
+        } else {
+            // ── Main pane region ──────────────────────────────────────────────
+            // Only forward when a session is focused; ignore when Home is focused.
+            if let Focus::Session(i) = self.focus {
+                // Translate terminal coordinates to 1-based pane-interior coords.
+                // The pane interior starts after the 26-wide sidebar and the
+                // main block's left border (1 cell), and below the top border
+                // (1 cell at row 0).
+                // col: terminal col 27 → pane col 1.  saturating_sub(26) gives 1-based.
+                // row: terminal row 1 → pane row 1.  m.row is already 0-based terminal,
+                //      so row 0 is inside the top border; row 1 is pane row 1 (1-based).
+                let pane_col = m.column.saturating_sub(mouse::SIDEBAR_WIDTH);
+                let pane_row = m.row;
+
+                // Bounds check: col 0 means we're on the left border — ignore.
+                if pane_col == 0 || pane_row == 0 {
+                    return;
+                }
+
+                // Check against the session's parser screen size.
+                if let Some((_, pty)) = self.sessions.get_mut(i) {
+                    let (screen_rows, screen_cols) = {
+                        let parser = pty.parser.lock().unwrap();
+                        let screen = parser.screen();
+                        (screen.size().0, screen.size().1)
+                    };
+                    if pane_col > screen_cols || pane_row > screen_rows {
+                        return; // out of bounds
+                    }
+                    if let Some(bytes) = mouse::encode_sgr(&m, pane_col, pane_row) {
+                        let _ = pty.writer.write_all(&bytes);
+                        let _ = pty.writer.flush();
+                    }
+                }
+            }
+            // Home focused: ignore main-pane mouse.
+        }
+    }
 }
 
 /// Interior size of the main pane given the full terminal size: subtract the
-/// 26-wide sidebar and 1-cell borders on each side.
+/// SIDEBAR_WIDTH-wide sidebar and 1-cell borders on each side.
 pub fn pane_dims(term_w: u16, term_h: u16) -> (u16, u16) {
-    let cols = term_w.saturating_sub(26).saturating_sub(2).max(1);
+    let cols = term_w.saturating_sub(mouse::SIDEBAR_WIDTH).saturating_sub(2).max(1);
     let rows = term_h.saturating_sub(2).max(1);
     (rows, cols)
 }

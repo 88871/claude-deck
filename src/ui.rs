@@ -343,7 +343,9 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         Style::default()
     };
     let gear = icons::settings(app.icons);
-    let settings_label = format!("{} Settings", gear);
+    // Show a subtle "mouse: off" indicator when mouse capture is disabled.
+    let mouse_indicator = if !app.mouse_on { "  mouse: off" } else { "" };
+    let settings_label = format!("{} Settings{}", gear, mouse_indicator);
     f.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(settings_label, settings_style)])),
         settings_row_area,
@@ -365,6 +367,7 @@ fn settings_rows(app: &App) -> Vec<(&'static str, String)> {
         ("Reap Timeout",    format!("{} s", cfg.reap_timeout_secs)),
         ("Mem Warn",        if cfg.mem_warn_mb == 0 { "off".to_string() } else { format!("{} MB", cfg.mem_warn_mb) }),
         ("Nerd Icons",      bool_val(cfg.nerd_icons)),
+        ("Mouse Capture",   bool_val(cfg.mouse)),
     ]
 }
 

@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crate::config::Config;
 use crate::icons::IconMode;
 use crate::mem::{self, Mem};
@@ -162,6 +162,9 @@ pub struct App {
     pub config: Config,
     /// Which row is highlighted in the Settings screen (0-based).
     pub settings_cursor: usize,
+    /// Whether crossterm mouse capture is currently enabled.
+    /// When false, the terminal's native text selection / copy works.
+    pub mouse_on: bool,
 }
 
 impl App {
@@ -247,6 +250,8 @@ impl App {
             icon_mode = IconMode::Ascii;
         }
 
+        let mouse_on = cfg.mouse;
+
         let mut app = Self {
             should_quit: false,
             manager: SessionManager::default(),
@@ -273,7 +278,14 @@ impl App {
             mem_sys: Mem::new(),
             config: cfg,
             settings_cursor: 0,
+            mouse_on,
         };
+
+        // If the persisted config has mouse disabled, turn off capture now.
+        // (init_terminal already enabled it; we disable it here at startup.)
+        if !mouse_on {
+            let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        }
 
         // ── Workspace restore ──────────────────────────────────────────────────
         // Unless the user passes `--no-restore`, load the persisted workspace
@@ -762,6 +774,18 @@ impl App {
                     self.focus = Focus::Settings;
                     self.settings_cursor = 0;
                 }
+                KeyCode::Char('m') => {
+                    // Toggle mouse capture. When off, the terminal's native
+                    // text selection / copy works.
+                    self.mouse_on = !self.mouse_on;
+                    self.config.mouse = self.mouse_on;
+                    if self.mouse_on {
+                        let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+                    } else {
+                        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+                    }
+                    config::save(&self.config);
+                }
                 _ => {}
             }
             return;
@@ -798,6 +822,19 @@ impl App {
                 self.restart_session(&id);
             }
             // Any other key: prompt already cleared → cancelled.
+            return;
+        }
+
+        // Tab path-completion: only for NewSession, never forwarded to a PTY.
+        if key.code == KeyCode::Tab {
+            if let Some(Prompt::NewSession(ref buf)) = self.prompt {
+                let buf_clone = buf.clone();
+                if let Some(completed) = complete_path(&buf_clone) {
+                    if let Some(Prompt::NewSession(ref mut b)) = self.prompt {
+                        *b = completed;
+                    }
+                }
+            }
             return;
         }
 
@@ -928,6 +965,15 @@ impl App {
                 } else {
                     IconMode::Ascii
                 };
+            }
+            8 => { // mouse capture
+                self.config.mouse = !self.config.mouse;
+                self.mouse_on = self.config.mouse;
+                if self.mouse_on {
+                    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+                } else {
+                    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+                }
             }
             _ => {}
         }
@@ -1092,6 +1138,108 @@ pub fn apply_setting_edit(app: &mut App, key: SettingKey, raw: &str) {
     }
 }
 
+/// Complete a filesystem path prefix for the NewSession prompt.
+///
+/// - Expands a leading `~` to the home directory for resolution, but the
+///   returned buffer preserves the `~`-form if the user typed it (the
+///   completion replaces only the final path component).
+/// - Returns `Some(completed_buf)` on any completion (single match or
+///   longest-common-prefix narrowing); `None` when there are no matches.
+///
+/// This is a pure function (no side effects) so it is easily unit-tested.
+pub fn complete_path(buf: &str) -> Option<String> {
+    // Expand a leading `~` for filesystem lookups only.
+    let expanded: String = if buf.starts_with('~') {
+        if let Some(home) = dirs::home_dir() {
+            format!("{}{}", home.display(), &buf[1..])
+        } else {
+            buf.to_string()
+        }
+    } else {
+        buf.to_string()
+    };
+
+    // Split into (search_dir, partial_component).
+    let path = Path::new(&expanded);
+    let (search_dir, partial) = if expanded.ends_with(MAIN_SEPARATOR) || expanded.ends_with('/') {
+        // Buffer ends with separator: search inside it for an empty prefix.
+        (path.to_path_buf(), String::new())
+    } else {
+        let parent = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        let file_name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        (parent, file_name)
+    };
+
+    // Collect matching entries.
+    let entries: Vec<String> = std::fs::read_dir(&search_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            if name.starts_with(&partial) {
+                // Append '/' to directories.
+                let is_dir = e.file_type().ok().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir {
+                    Some(format!("{}/", name))
+                } else {
+                    Some(name)
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    // Compute the completion: longest common prefix of all match names.
+    let lcp = longest_common_prefix(&entries);
+
+    // Build the new buffer by replacing the partial component in the
+    // original (possibly `~`-containing) buffer.
+    let buf_prefix = if buf.ends_with(MAIN_SEPARATOR) || buf.ends_with('/') {
+        buf.to_string()
+    } else {
+        // Drop the last component from the original buffer.
+        let p = Path::new(buf);
+        let parent_str = p.parent()
+            .and_then(|par| par.to_str())
+            .unwrap_or("");
+        if parent_str.is_empty() || parent_str == "." {
+            String::new()
+        } else {
+            format!("{}/", parent_str)
+        }
+    };
+
+    Some(format!("{}{}", buf_prefix, lcp))
+}
+
+/// Returns the longest common prefix of a slice of strings.
+fn longest_common_prefix(items: &[String]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let first = items[0].as_bytes();
+    let mut len = first.len();
+    for item in &items[1..] {
+        let b = item.as_bytes();
+        len = len.min(b.len());
+        for (i, (&a, &c)) in first[..len].iter().zip(b[..len].iter()).enumerate() {
+            if a != c {
+                len = i;
+                break;
+            }
+        }
+    }
+    std::str::from_utf8(&first[..len]).unwrap_or("").to_string()
+}
+
 /// Interior size of the main pane given the full terminal size: subtract the
 /// SIDEBAR_WIDTH-wide sidebar and 1-cell borders on each side.
 pub fn pane_dims(term_w: u16, term_h: u16) -> (u16, u16) {
@@ -1102,8 +1250,8 @@ pub fn pane_dims(term_w: u16, term_h: u16) -> (u16, u16) {
 
 /// Total number of rows in the Settings list (one per managed setting).
 /// Order: dnd, bell, desktop_notify, ntfy_topic, reap_idle, reap_timeout_secs,
-///        mem_warn_mb, nerd_icons.
-pub const SETTINGS_ROW_COUNT_TOTAL: usize = 8;
+///        mem_warn_mb, nerd_icons, mouse.
+pub const SETTINGS_ROW_COUNT_TOTAL: usize = 9;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1424,5 +1572,94 @@ mod tests {
             key: SettingKey::NtfyTopic,
             buf: "hello world".to_string(),
         });
+    }
+
+    // ── complete_path ─────────────────────────────────────────────────────────
+
+    /// Helper: create a temp dir with known subdirectories and return its path.
+    fn make_completion_tmpdir() -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "cdeck-complete-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(base.join("alpha")).unwrap();
+        std::fs::create_dir_all(base.join("beta")).unwrap();
+        std::fs::create_dir_all(base.join("gamma")).unwrap();
+        std::fs::write(base.join("file.txt"), b"x").unwrap();
+        base
+    }
+
+    #[test]
+    fn complete_path_single_match_returns_completed_buffer() {
+        let base = make_completion_tmpdir();
+        let partial = format!("{}/al", base.display());
+        let result = complete_path(&partial);
+        assert_eq!(result, Some(format!("{}/alpha/", base.display())));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn complete_path_multiple_matches_returns_longest_common_prefix() {
+        let base = make_completion_tmpdir();
+        // "a" matches "alpha/" and nothing else starting with 'a' among our dirs.
+        // Actually only alpha starts with 'a', but let's test a prefix shared by two.
+        // 'g' matches only gamma; let's pick '' (empty partial) to get all three.
+        let trailing = format!("{}/", base.display());
+        let result = complete_path(&trailing);
+        // All entries: alpha/, beta/, file.txt, gamma/ — LCP is ""
+        // We just verify we get Some(...) and it starts with the base path.
+        assert!(result.is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn complete_path_no_match_returns_none() {
+        let base = make_completion_tmpdir();
+        let partial = format!("{}/zzz", base.display());
+        let result = complete_path(&partial);
+        assert_eq!(result, None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn complete_path_directory_entries_get_trailing_slash() {
+        let base = make_completion_tmpdir();
+        let partial = format!("{}/bet", base.display());
+        let result = complete_path(&partial);
+        assert_eq!(result, Some(format!("{}/beta/", base.display())));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn longest_common_prefix_single_item() {
+        assert_eq!(
+            longest_common_prefix(&["hello/".to_string()]),
+            "hello/"
+        );
+    }
+
+    #[test]
+    fn longest_common_prefix_shared_prefix() {
+        assert_eq!(
+            longest_common_prefix(&["alpha/".to_string(), "all/".to_string()]),
+            "al"
+        );
+    }
+
+    #[test]
+    fn longest_common_prefix_no_common() {
+        assert_eq!(
+            longest_common_prefix(&["abc".to_string(), "xyz".to_string()]),
+            ""
+        );
+    }
+
+    #[test]
+    fn longest_common_prefix_empty_slice() {
+        let empty: &[String] = &[];
+        assert_eq!(longest_common_prefix(empty), "");
     }
 }

@@ -24,6 +24,9 @@ pub struct Config {
     pub mem_warn_mb: u64,
     /// Use Nerd Font glyphs. When false, unicode/ASCII fallbacks are used.
     pub nerd_icons: bool,
+    /// Enable mouse capture (crossterm). When false, the terminal's native
+    /// text-selection / copy works unimpeded.
+    pub mouse: bool,
 }
 
 impl Default for Config {
@@ -37,6 +40,7 @@ impl Default for Config {
             reap_timeout_secs: 600,
             mem_warn_mb: 4096,
             nerd_icons: false,
+            mouse: true,
         }
     }
 }
@@ -97,6 +101,7 @@ mod tests {
             reap_timeout_secs: 300,
             mem_warn_mb: 2048,
             nerd_icons: true,
+            mouse: false,
         }
     }
 
@@ -153,5 +158,6 @@ mod tests {
         assert_eq!(cfg.reap_timeout_secs, 600);
         assert_eq!(cfg.mem_warn_mb, 4096);
         assert!(!cfg.nerd_icons);
+        assert!(cfg.mouse);
     }
 }

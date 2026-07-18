@@ -304,9 +304,10 @@ Wires the Rust core to a live pseudo-terminal running the real `claude` binary, 
   - Tauri command `write_to_pty(id: String, data: String) -> Result<(), String>`.
   - Tauri command `resize_pty(id: String, cols: u16, rows: u16) -> Result<(), String>`.
   - Tauri event `pty://data` with payload `{ id: String, b64: String }` — **base64 of raw PTY bytes** (NOT a decoded string). The frontend decodes to `Uint8Array` and calls `term.write(bytes)`; xterm.js decodes UTF-8 incrementally so multi-byte characters split across reads are reassembled correctly. (Review fix #1 — never `from_utf8_lossy` per read.)
-  - Tauri event `session://state` with payload `{ id: String, state: SessionState }` (camelCase string, e.g. `"running"`, `"error"`). Also emitted with `"error"` by the child-exit waiter thread.
+  - Tauri event `session://state` with payload `{ id: String, state: SessionState }` (camelCase string, e.g. `"running"`). The child-exit waiter also emits this event with wire-only values `"closed"` (clean exit) or `"error"` (abnormal exit) — Review nuance #2.
   - Rust struct `PtyHandle { writer: Box<dyn Write + Send>, master: Box<dyn MasterPty + Send>, killer: Box<dyn ChildKiller + Send + Sync> }` held per session as `Arc<Mutex<PtyHandle>>` in shared state (per-session lock; Review fix #7). `killer` is `#[allow(dead_code)]` here — Plan 2 uses it for reaping.
-  - Rust fn `resolve_claude_path() -> String` (login-shell probe; Review fix #3).
+  - Rust fn `resolve_claude_path() -> Option<String>` (login-shell probe; Review fix #3). Called **once at startup** and cached in `AppState.claude_path` (Review nuance #3). `start_session` returns an onboarding `Err` when it is `None` (Spec §9).
+  - `spawn_claude(app, id, cwd, claude_path: &str)` takes the cached path (does not re-probe).
 
 - [ ] **Step 1: Add dependencies to `src-tauri/Cargo.toml`**
 
@@ -333,35 +334,42 @@ pub struct PtyHandle {
     pub killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
-/// Resolve the `claude` binary path. A packaged macOS app launched from Finder
-/// gets a minimal PATH, so npm-global / `~/.local/bin` binaries are absent —
-/// probe the user's login shell. Falls back to bare `claude` (dev via shell).
-/// (Review fix #3.)
-pub fn resolve_claude_path() -> String {
+/// Probe the user's login shell for the `claude` binary. A packaged macOS app
+/// launched from Finder gets a minimal PATH (npm-global / `~/.local/bin`
+/// absent), so `-lc` sources the user's profile. Returns `None` if not found —
+/// the caller surfaces the §9 onboarding error. Run ONCE at startup and cache:
+/// `-lc` sources `.zprofile`/`.profile` and can take a few hundred ms, so this
+/// must not run per-spawn (Review nuance #3).
+pub fn resolve_claude_path() -> Option<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    if let Ok(o) = Command::new(&shell).args(["-lc", "command -v claude"]).output() {
-        if o.status.success() {
-            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !p.is_empty() {
-                return p;
-            }
-        }
+    let out = Command::new(&shell).args(["-lc", "command -v claude"]).output().ok()?;
+    if !out.status.success() {
+        return None;
     }
-    "claude".to_string()
+    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if p.is_empty() { None } else { Some(p) }
 }
 
-/// Spawn `claude` in `cwd`. Streams raw PTY bytes to the frontend as base64 in
-/// `pty://data` events tagged with `id` (frontend decodes; xterm handles UTF-8
-/// across chunk boundaries — Review fix #1). A waiter thread reports child exit
-/// as a `session://state` `"error"` event so crashes are visible and the child
-/// is reaped, not left a zombie (Review fix #2).
-pub fn spawn_claude(app: AppHandle, id: String, cwd: &Path) -> Result<PtyHandle, String> {
+/// Spawn `claude` (at the pre-resolved `claude_path`) in `cwd`. Streams raw PTY
+/// bytes to the frontend as base64 in `pty://data` events tagged with `id`
+/// (frontend decodes; xterm handles UTF-8 across chunk boundaries — Review fix
+/// #1). A waiter thread reports child exit via `session://state`: `"closed"` for
+/// a clean exit (`/exit`, Ctrl-D, status 0) and `"error"` for a nonzero/abnormal
+/// exit, so an intentional close is not shown as a failure (Review nuance #2).
+/// `clone_killer()` is stored in `PtyHandle` for Plan 2 reaping — the child is
+/// waited on, never left a zombie (Review fix #2).
+pub fn spawn_claude(
+    app: AppHandle,
+    id: String,
+    cwd: &Path,
+    claude_path: &str,
+) -> Result<PtyHandle, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| e.to_string())?;
 
-    let mut cmd = CommandBuilder::new(resolve_claude_path());
+    let mut cmd = CommandBuilder::new(claude_path);
     cmd.cwd(cwd);
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
@@ -391,15 +399,16 @@ pub fn spawn_claude(app: AppHandle, id: String, cwd: &Path) -> Result<PtyHandle,
         }
     });
 
-    // Waiter thread: block on child exit → mark the session errored/exited.
+    // Waiter thread: block on child exit → clean vs. abnormal (Review nuance #2).
     let exit_id = id.clone();
     let exit_app = app.clone();
     std::thread::spawn(move || {
         let mut child = child;
-        let _ = child.wait();
+        let clean = child.wait().map(|s| s.success()).unwrap_or(false);
+        let state = if clean { "closed" } else { "error" };
         let _ = exit_app.emit(
             "session://state",
-            serde_json::json!({ "id": exit_id, "state": "error" }),
+            serde_json::json!({ "id": exit_id, "state": state }),
         );
     });
 
@@ -417,18 +426,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use core::session::{SessionManager, SessionState};
-use pty::{spawn_claude, PtyHandle};
+use pty::{resolve_claude_path, spawn_claude, PtyHandle};
 use portable_pty::PtySize;
 use std::io::Write;
 use tauri::{AppHandle, Emitter, State};
 
-#[derive(Default)]
 struct AppState {
     manager: Mutex<SessionManager>,
     // Each PTY behind its own lock so a blocked/full session's write never
     // stalls another session's input (Review fix #7). The map lock is held
     // only long enough to clone out the Arc.
     ptys: Mutex<HashMap<String, Arc<Mutex<PtyHandle>>>>,
+    // Resolved once at startup (Review nuance #3); None → claude not installed.
+    claude_path: Option<String>,
 }
 
 fn emit_state(app: &AppHandle, id: &str, state: SessionState) {
@@ -437,9 +447,13 @@ fn emit_state(app: &AppHandle, id: &str, state: SessionState) {
 
 #[tauri::command]
 fn start_session(app: AppHandle, state: State<AppState>, cwd: String) -> Result<String, String> {
+    let claude_path = state
+        .claude_path
+        .clone()
+        .ok_or("claude not found — install and log in to Claude Code, then restart")?;
     let path = PathBuf::from(&cwd);
     let id = { state.manager.lock().unwrap().create(path.clone()) };
-    let handle = spawn_claude(app.clone(), id.clone(), &path)?;
+    let handle = spawn_claude(app.clone(), id.clone(), &path, &claude_path)?;
     state.ptys.lock().unwrap().insert(id.clone(), Arc::new(Mutex::new(handle)));
     state.manager.lock().unwrap().set_state(&id, SessionState::Running);
     emit_state(&app, &id, SessionState::Running);
@@ -470,8 +484,13 @@ fn resize_pty(state: State<AppState>, id: String, cols: u16, rows: u16) -> Resul
 }
 
 fn main() {
+    let app_state = AppState {
+        manager: Mutex::new(SessionManager::new()),
+        ptys: Mutex::new(HashMap::new()),
+        claude_path: resolve_claude_path(), // once, at startup (Review nuance #3)
+    };
     tauri::Builder::default()
-        .manage(AppState::default())
+        .manage(app_state)
         .invoke_handler(tauri::generate_handler![start_session, write_to_pty, resize_pty])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -643,7 +662,8 @@ import "@xterm/xterm/css/xterm.css";
 interface Pane { term: Terminal; fit: FitAddon; el: HTMLElement; }
 const panes = new Map<string, Pane>();
 const glyphs: Record<string, string> = {
-  starting: "○", running: "⏳", waitingOnYou: "◍", idle: "✓", parked: "◌", error: "✗",
+  starting: "○", running: "⏳", waitingOnYou: "◍", idle: "✓", parked: "◌",
+  closed: "⏹", error: "✗", // closed = clean exit (/exit, Ctrl-D); error = abnormal
 };
 let activeId: string | null = null;
 
@@ -749,9 +769,14 @@ window.addEventListener("resize", fitActive);
 
 document.getElementById("new-session")!.addEventListener("click", async () => {
   const dir = await open({ directory: true, multiple: false });
-  if (typeof dir === "string") {
+  if (typeof dir !== "string") return;
+  try {
     await openSession(dir);
     await refreshSidebar();
+  } catch (err) {
+    // Surfaces the §9 onboarding error (e.g. claude not installed / not logged in).
+    // Foundation stopgap; Plan 2 replaces it with an inline onboarding panel.
+    alert(String(err));
   }
 });
 ```
@@ -796,18 +821,19 @@ git commit -m "feat: multi-session sidebar with folder picker and switching"
 
 **Placeholder scan:** No TBD/TODO. The only intentionally temporary code (Task 3 auto-start-one-session) is explicitly replaced in Task 4 Step 6. ✓
 
-**Type consistency:** `SessionState` variants (`Starting/Running/WaitingOnYou/Idle/Parked/Error`) serialize camelCase and match the frontend `glyphs` keys (`starting/running/waitingOnYou/idle/parked/error`). Command names (`start_session`, `write_to_pty`, `resize_pty`, `list_sessions`) and event names (`pty://data`, `session://state`) are identical across Rust and TS. ✓
+**Type consistency:** `SessionState` variants (`Starting/Running/WaitingOnYou/Idle/Parked/Error`) serialize camelCase and are a subset of the frontend `glyphs` keys. The `glyphs` map additionally carries `closed` — a wire-only exit signal emitted by the waiter thread, intentionally not a Rust enum variant (avoids a never-constructed-variant warning; documented under Known limitations). All keys covered: `starting/running/waitingOnYou/idle/parked/closed/error`. Command names (`start_session`, `write_to_pty`, `resize_pty`, `list_sessions`) and event names (`pty://data` with `b64`, `session://state` with `state`) are identical across Rust and TS. ✓
 
 **Note on `--session-id`:** This plan deliberately does *not* pass `--session-id` to `claude` (Task 3 uses a plain spawn) because that flag is unverified; Task 3 Step 8 confirms it, and Plan 2 adopts it for resume/correlation once confirmed.
 
 **Pre-execution review fixes applied (from human review of the draft plan):**
 1. **UTF-8 chunk boundaries** — PTY bytes are base64'd over IPC and decoded to `Uint8Array` on the frontend; `term.write` reassembles multi-byte chars across reads. No per-read `from_utf8_lossy`. (Task 3 Steps 2/5, Task 4 Step 5)
-2. **Child exit visibility** — child moved into a waiter thread that emits `session://state`→`error`; `clone_killer()` stored in `PtyHandle` for Plan 2 reaping (no zombies). (Task 3 Step 2)
-3. **Packaged-app PATH** — `resolve_claude_path()` probes the login shell (`$SHELL -lc 'command -v claude'`) with a `"claude"` fallback; Step 6 verifies via the same command. (Task 3 Steps 2/6)
+2. **Child exit visibility** — child moved into a waiter thread; `clone_killer()` stored in `PtyHandle` for Plan 2 reaping (no zombies). The waiter branches on `wait().success()`: clean exit → `"closed"` (neutral glyph), abnormal → `"error"`, so an intentional `/exit`/Ctrl-D isn't a red ✗ (Review nuance #2). (Task 3 Step 2, Task 4 Step 5 glyphs)
+3. **Packaged-app PATH** — `resolve_claude_path() -> Option<String>` probes the login shell (`$SHELL -lc 'command -v claude'`), resolved **once at startup** and cached in `AppState.claude_path` (Review nuance #3 — not per-spawn); `None` → `start_session` returns the §9 onboarding `Err`, surfaced by the frontend. Step 6 verifies via the same command. (Task 3 Steps 2/3/6, Task 4 Step 6)
 4. **Resize after main.ts replacement** — `fitActive()` exported and bound to `window` resize. (Task 4 Steps 5/6)
 5. **Label injection** — sidebar rows built with `textContent`, not `innerHTML`. (Task 4 Step 5)
 7. **Head-of-line write lock** — PTYs stored as `Arc<Mutex<PtyHandle>>`; the map lock is released before the blocking write, so one stalled session can't block another's input. (Task 3 Step 3)
 
 **Known limitations (deferred, by design):**
-- **#6 One IPC event per 8KB read.** Fine for MVP; if heavy output (large dumps, fast build logs) ever makes scrolling stutter, batch reads on a ~16ms tick before emitting. Not implemented preemptively.
-- **Manager state on exit.** The waiter thread emits `session://state`→`error` for the glyph but does not update the Rust `SessionManager` (avoids a cross-module `AppState` dependency in `pty.rs`). Sidebar stays correct because it isn't re-rendered from `list_sessions` after exit in this plan; Plan 2 gives the manager true ownership of exit state.
+- **#6 One IPC event per 8KB read.** Fine for MVP; if heavy output (large dumps, fast build logs) ever makes scrolling stutter, the upgrade path is **Tauri's Channel API** (per-session, cheaper than the global event bus; same base64 payload, so the frontend `b64ToBytes` decode carries over unchanged) — or batch reads on a ~16ms tick before emitting. Not implemented preemptively.
+- **Manager state on exit.** The waiter thread emits `session://state`→`closed`/`error` for the glyph but does not update the Rust `SessionManager` (avoids a cross-module `AppState` dependency in `pty.rs`). Sidebar stays correct because it isn't re-rendered from `list_sessions` after exit in this plan; Plan 2 gives the manager true ownership of exit state.
+- **#7 optional refinement (not adopted).** The per-session `Arc<Mutex<PtyHandle>>` already removes the cross-session write stall. A further split — `Arc<Mutex<Box<dyn Write + Send>>>` for just the writer, with `master`/`killer` separate — would keep resize/kill from ever contending with a blocked write on the *same* session. Deferred for handle cohesion; revisit only if intra-session resize latency is ever observed.

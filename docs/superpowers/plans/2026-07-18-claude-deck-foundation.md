@@ -303,14 +303,16 @@ Wires the Rust core to a live pseudo-terminal running the real `claude` binary, 
   - Tauri command `start_session(cwd: String) -> Result<String, String>` — spawns `claude` in `cwd`, returns session id.
   - Tauri command `write_to_pty(id: String, data: String) -> Result<(), String>`.
   - Tauri command `resize_pty(id: String, cols: u16, rows: u16) -> Result<(), String>`.
-  - Tauri event `pty://data` with payload `{ id: String, chunk: String }` (UTF-8 lossy).
-  - Tauri event `session://state` with payload `{ id: String, state: SessionState }`.
-  - Rust struct `PtyHandle { writer: Box<dyn Write + Send>, master: Box<dyn MasterPty + Send> }` held per session in shared state.
+  - Tauri event `pty://data` with payload `{ id: String, b64: String }` — **base64 of raw PTY bytes** (NOT a decoded string). The frontend decodes to `Uint8Array` and calls `term.write(bytes)`; xterm.js decodes UTF-8 incrementally so multi-byte characters split across reads are reassembled correctly. (Review fix #1 — never `from_utf8_lossy` per read.)
+  - Tauri event `session://state` with payload `{ id: String, state: SessionState }` (camelCase string, e.g. `"running"`, `"error"`). Also emitted with `"error"` by the child-exit waiter thread.
+  - Rust struct `PtyHandle { writer: Box<dyn Write + Send>, master: Box<dyn MasterPty + Send>, killer: Box<dyn ChildKiller + Send + Sync> }` held per session as `Arc<Mutex<PtyHandle>>` in shared state (per-session lock; Review fix #7). `killer` is `#[allow(dead_code)]` here — Plan 2 uses it for reaping.
+  - Rust fn `resolve_claude_path() -> String` (login-shell probe; Review fix #3).
 
-- [ ] **Step 1: Add `portable-pty` to `src-tauri/Cargo.toml`**
+- [ ] **Step 1: Add dependencies to `src-tauri/Cargo.toml`**
 
 ```toml
 portable-pty = "0.8"
+base64 = "0.22"
 ```
 
 - [ ] **Step 2: Implement the PTY spawn helper in `src-tauri/src/pty.rs`**
@@ -318,48 +320,90 @@ portable-pty = "0.8"
 ```rust
 use std::io::{Read, Write};
 use std::path::Path;
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use std::process::Command;
+use base64::Engine;
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tauri::{AppHandle, Emitter};
 
 pub struct PtyHandle {
     pub writer: Box<dyn Write + Send>,
     pub master: Box<dyn MasterPty + Send>,
+    // Kept for Plan 2 (reaping/kill). Unused in the foundation.
+    #[allow(dead_code)]
+    pub killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
-/// Spawn `claude` in `cwd`, streaming output to the frontend as `pty://data`
-/// events tagged with `id`. Returns a handle for writing input and resizing.
+/// Resolve the `claude` binary path. A packaged macOS app launched from Finder
+/// gets a minimal PATH, so npm-global / `~/.local/bin` binaries are absent —
+/// probe the user's login shell. Falls back to bare `claude` (dev via shell).
+/// (Review fix #3.)
+pub fn resolve_claude_path() -> String {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    if let Ok(o) = Command::new(&shell).args(["-lc", "command -v claude"]).output() {
+        if o.status.success() {
+            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !p.is_empty() {
+                return p;
+            }
+        }
+    }
+    "claude".to_string()
+}
+
+/// Spawn `claude` in `cwd`. Streams raw PTY bytes to the frontend as base64 in
+/// `pty://data` events tagged with `id` (frontend decodes; xterm handles UTF-8
+/// across chunk boundaries — Review fix #1). A waiter thread reports child exit
+/// as a `session://state` `"error"` event so crashes are visible and the child
+/// is reaped, not left a zombie (Review fix #2).
 pub fn spawn_claude(app: AppHandle, id: String, cwd: &Path) -> Result<PtyHandle, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| e.to_string())?;
 
-    let mut cmd = CommandBuilder::new("claude");
+    let mut cmd = CommandBuilder::new(resolve_claude_path());
     cmd.cwd(cwd);
 
-    let _child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+    let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
+    let killer = child.clone_killer();
 
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
 
-    let emit_id = id.clone();
+    // Reader thread: forward raw bytes as base64 (no lossy per-read decode).
+    let read_id = id.clone();
+    let read_app = app.clone();
     std::thread::spawn(move || {
+        let engine = base64::engine::general_purpose::STANDARD;
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = app.emit("pty://data", serde_json::json!({
-                        "id": emit_id, "chunk": chunk,
-                    }));
+                    let b64 = engine.encode(&buf[..n]);
+                    let _ = read_app.emit(
+                        "pty://data",
+                        serde_json::json!({ "id": read_id, "b64": b64 }),
+                    );
                 }
             }
         }
     });
 
-    Ok(PtyHandle { writer, master: pair.master })
+    // Waiter thread: block on child exit → mark the session errored/exited.
+    let exit_id = id.clone();
+    let exit_app = app.clone();
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+        let _ = exit_app.emit(
+            "session://state",
+            serde_json::json!({ "id": exit_id, "state": "error" }),
+        );
+    });
+
+    Ok(PtyHandle { writer, master: pair.master, killer })
 }
 ```
 
@@ -370,18 +414,21 @@ mod core;
 mod pty;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use core::session::{SessionManager, SessionState};
 use pty::{spawn_claude, PtyHandle};
 use portable_pty::PtySize;
 use std::io::Write;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 #[derive(Default)]
 struct AppState {
     manager: Mutex<SessionManager>,
-    ptys: Mutex<HashMap<String, PtyHandle>>,
+    // Each PTY behind its own lock so a blocked/full session's write never
+    // stalls another session's input (Review fix #7). The map lock is held
+    // only long enough to clone out the Arc.
+    ptys: Mutex<HashMap<String, Arc<Mutex<PtyHandle>>>>,
 }
 
 fn emit_state(app: &AppHandle, id: &str, state: SessionState) {
@@ -393,28 +440,31 @@ fn start_session(app: AppHandle, state: State<AppState>, cwd: String) -> Result<
     let path = PathBuf::from(&cwd);
     let id = { state.manager.lock().unwrap().create(path.clone()) };
     let handle = spawn_claude(app.clone(), id.clone(), &path)?;
-    state.ptys.lock().unwrap().insert(id.clone(), handle);
-    {
-        let mut m = state.manager.lock().unwrap();
-        m.set_state(&id, SessionState::Running);
-    }
+    state.ptys.lock().unwrap().insert(id.clone(), Arc::new(Mutex::new(handle)));
+    state.manager.lock().unwrap().set_state(&id, SessionState::Running);
     emit_state(&app, &id, SessionState::Running);
     Ok(id)
 }
 
 #[tauri::command]
 fn write_to_pty(state: State<AppState>, id: String, data: String) -> Result<(), String> {
-    let mut ptys = state.ptys.lock().unwrap();
-    let handle = ptys.get_mut(&id).ok_or("unknown session")?;
-    handle.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
-    handle.writer.flush().map_err(|e| e.to_string())
+    let handle = {
+        let ptys = state.ptys.lock().unwrap();
+        ptys.get(&id).cloned().ok_or("unknown session")?
+    };
+    let mut h = handle.lock().unwrap();
+    h.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+    h.writer.flush().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn resize_pty(state: State<AppState>, id: String, cols: u16, rows: u16) -> Result<(), String> {
-    let ptys = state.ptys.lock().unwrap();
-    let handle = ptys.get(&id).ok_or("unknown session")?;
-    handle.master
+    let handle = {
+        let ptys = state.ptys.lock().unwrap();
+        ptys.get(&id).cloned().ok_or("unknown session")?
+    };
+    let h = handle.lock().unwrap();
+    h.master
         .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| e.to_string())
 }
@@ -440,13 +490,23 @@ Replace the placeholder body with input/output wiring (keep the terminal setup f
 ```typescript
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { homeDir } from "@tauri-apps/api/path";
 
 // ...existing term + fit setup from Task 1...
 
 let sessionId: string | null = null;
 
-listen<{ id: string; chunk: string }>("pty://data", (e) => {
-  if (e.payload.id === sessionId) term.write(e.payload.chunk);
+// Decode base64 PTY bytes → Uint8Array; xterm.write handles UTF-8 across
+// chunk boundaries, so we never build a lossy string (Review fix #1).
+function b64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+listen<{ id: string; b64: string }>("pty://data", (e) => {
+  if (e.payload.id === sessionId) term.write(b64ToBytes(e.payload.b64));
 });
 
 term.onData((data) => {
@@ -459,17 +519,17 @@ function syncSize() {
 }
 window.addEventListener("resize", syncSize);
 
-// Temporary: start one session in the home directory on load.
+// Temporary: start one session in the home directory on load (replaced in Task 4).
 (async () => {
-  sessionId = await invoke<string>("start_session", { cwd: (await import("@tauri-apps/api/path")).homeDir ? await (await import("@tauri-apps/api/path")).homeDir() : "." });
+  sessionId = await invoke<string>("start_session", { cwd: await homeDir() });
   syncSize();
 })();
 ```
 
-- [ ] **Step 6: Verify `claude` is on PATH**
+- [ ] **Step 6: Verify `claude` resolves via the login shell**
 
-Run: `which claude`
-Expected: a path prints. If not, the session will error — install/login to Claude Code first (`claude` interactive once) before testing.
+Run: `"$SHELL" -lc 'command -v claude'`
+Expected: a path prints (this is exactly what `resolve_claude_path()` runs, so it matches both `tauri dev` and a packaged app). If nothing prints, install/login to Claude Code first (run `claude` interactively once) before testing.
 
 - [ ] **Step 7: Run the app and verify a live session**
 
@@ -513,8 +573,10 @@ Generalizes from one hard-coded session to many, adds the sidebar UI, the "＋ n
   - Frontend module `sessions.ts` exporting:
     - `openSession(cwd: string): Promise<string>` (starts backend session + creates its xterm buffer)
     - `focusSession(id: string): void` (shows that session's terminal, hides others)
+    - `writeToSession(id: string, b64: string): void` (decodes base64 → `Uint8Array` → `term.write`)
     - `setSidebarState(id: string, state: string): void`
     - `renderSidebar(sessions: {id,label,state}[]): void`
+    - `fitActive(): void` (refits the focused pane + resizes its PTY — bound to `window` resize; Review fix #4)
 
 - [ ] **Step 1: Add the dialog plugin (Rust)**
 
@@ -585,6 +647,14 @@ const glyphs: Record<string, string> = {
 };
 let activeId: string | null = null;
 
+// base64 PTY bytes → Uint8Array; xterm handles UTF-8 across chunks (Review fix #1).
+function b64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
 export async function openSession(cwd: string): Promise<string> {
   const id = await invoke<string>("start_session", { cwd });
   const el = document.createElement("div");
@@ -601,8 +671,8 @@ export async function openSession(cwd: string): Promise<string> {
   return id;
 }
 
-export function writeToSession(id: string, chunk: string) {
-  panes.get(id)?.term.write(chunk);
+export function writeToSession(id: string, b64: string) {
+  panes.get(id)?.term.write(b64ToBytes(b64));
 }
 
 export function focusSession(id: string) {
@@ -618,6 +688,17 @@ export function focusSession(id: string) {
     row.classList.toggle("active", (row as HTMLElement).dataset.id === id);
 }
 
+// Refit the focused pane and push the new size to its PTY. Bound to window
+// resize so terminals reflow (Review fix #4 — Task 3's resize handler was
+// dropped when main.ts was replaced).
+export function fitActive() {
+  if (!activeId) return;
+  const p = panes.get(activeId);
+  if (!p) return;
+  p.fit.fit();
+  invoke("resize_pty", { id: activeId, cols: p.term.cols, rows: p.term.rows });
+}
+
 export function renderSidebar(sessions: { id: string; label: string; state: string }[]) {
   const list = document.getElementById("session-list")!;
   list.innerHTML = "";
@@ -625,7 +706,14 @@ export function renderSidebar(sessions: { id: string; label: string; state: stri
     const li = document.createElement("li");
     li.className = "session-row" + (s.id === activeId ? " active" : "");
     li.dataset.id = s.id;
-    li.innerHTML = `<span class="glyph">${glyphs[s.state] ?? "○"}</span><span>${s.label}</span>`;
+    // Build with textContent — directory-derived labels may contain < & etc.
+    // (Review fix #5; never innerHTML untrusted text).
+    const glyph = document.createElement("span");
+    glyph.className = "glyph";
+    glyph.textContent = glyphs[s.state] ?? "○";
+    const label = document.createElement("span");
+    label.textContent = s.label;
+    li.append(glyph, label);
     li.addEventListener("click", () => focusSession(s.id));
     list.appendChild(li);
   }
@@ -646,15 +734,18 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
-import { openSession, writeToSession, setSidebarState, renderSidebar, activeSession } from "./sessions";
+import { openSession, writeToSession, setSidebarState, renderSidebar, fitActive } from "./sessions";
 
 async function refreshSidebar() {
   const sessions = await invoke<{ id: string; label: string; state: string }[]>("list_sessions");
   renderSidebar(sessions);
 }
 
-listen<{ id: string; chunk: string }>("pty://data", (e) => writeToSession(e.payload.id, e.payload.chunk));
+listen<{ id: string; b64: string }>("pty://data", (e) => writeToSession(e.payload.id, e.payload.b64));
 listen<{ id: string; state: string }>("session://state", (e) => setSidebarState(e.payload.id, e.payload.state));
+
+// Reflow the focused terminal on window resize (Review fix #4).
+window.addEventListener("resize", fitActive);
 
 document.getElementById("new-session")!.addEventListener("click", async () => {
   const dir = await open({ directory: true, multiple: false });
@@ -680,6 +771,8 @@ Expected:
 - Add a second session in a different folder; both appear in the sidebar.
 - Clicking a sidebar row switches the terminal to that session; each session keeps its own scrollback.
 - Typing goes to the focused session only.
+- Resizing the window reflows the focused terminal (no clipped/misaligned output) — confirms Review fix #4.
+- Output with box-drawing/emoji (e.g. Claude Code's UI, `ls` of a repo) renders without `�` glitches — confirms Review fix #1.
 
 - [ ] **Step 9: Commit**
 
@@ -706,3 +799,15 @@ git commit -m "feat: multi-session sidebar with folder picker and switching"
 **Type consistency:** `SessionState` variants (`Starting/Running/WaitingOnYou/Idle/Parked/Error`) serialize camelCase and match the frontend `glyphs` keys (`starting/running/waitingOnYou/idle/parked/error`). Command names (`start_session`, `write_to_pty`, `resize_pty`, `list_sessions`) and event names (`pty://data`, `session://state`) are identical across Rust and TS. ✓
 
 **Note on `--session-id`:** This plan deliberately does *not* pass `--session-id` to `claude` (Task 3 uses a plain spawn) because that flag is unverified; Task 3 Step 8 confirms it, and Plan 2 adopts it for resume/correlation once confirmed.
+
+**Pre-execution review fixes applied (from human review of the draft plan):**
+1. **UTF-8 chunk boundaries** — PTY bytes are base64'd over IPC and decoded to `Uint8Array` on the frontend; `term.write` reassembles multi-byte chars across reads. No per-read `from_utf8_lossy`. (Task 3 Steps 2/5, Task 4 Step 5)
+2. **Child exit visibility** — child moved into a waiter thread that emits `session://state`→`error`; `clone_killer()` stored in `PtyHandle` for Plan 2 reaping (no zombies). (Task 3 Step 2)
+3. **Packaged-app PATH** — `resolve_claude_path()` probes the login shell (`$SHELL -lc 'command -v claude'`) with a `"claude"` fallback; Step 6 verifies via the same command. (Task 3 Steps 2/6)
+4. **Resize after main.ts replacement** — `fitActive()` exported and bound to `window` resize. (Task 4 Steps 5/6)
+5. **Label injection** — sidebar rows built with `textContent`, not `innerHTML`. (Task 4 Step 5)
+7. **Head-of-line write lock** — PTYs stored as `Arc<Mutex<PtyHandle>>`; the map lock is released before the blocking write, so one stalled session can't block another's input. (Task 3 Step 3)
+
+**Known limitations (deferred, by design):**
+- **#6 One IPC event per 8KB read.** Fine for MVP; if heavy output (large dumps, fast build logs) ever makes scrolling stutter, batch reads on a ~16ms tick before emitting. Not implemented preemptively.
+- **Manager state on exit.** The waiter thread emits `session://state`→`error` for the glyph but does not update the Rust `SessionManager` (avoids a cross-module `AppState` dependency in `pty.rs`). Sidebar stays correct because it isn't re-rendered from `list_sessions` after exit in this plan; Plan 2 gives the manager true ownership of exit state.

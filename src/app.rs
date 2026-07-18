@@ -14,13 +14,64 @@ pub enum AppEvent {
     Exited { id: String, clean: bool },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Focus {
+    Home,
+    Session(usize),
+}
+
+// ── Pure focus-transition helpers (testable without a live PTY) ──────────────
+
+/// Build the ordered list of visible "slots": Home (if visible) then each
+/// session index.  Returns indices as `Focus` values.
+pub fn visible_entries(home_visible: bool, session_count: usize) -> Vec<Focus> {
+    let mut v = Vec::new();
+    if home_visible {
+        v.push(Focus::Home);
+    }
+    for i in 0..session_count {
+        v.push(Focus::Session(i));
+    }
+    v
+}
+
+/// Compute the next focus when cycling forward (+1) or backward (-1).
+/// Returns the current focus unchanged if there are no visible entries.
+pub fn cycle_focus(focus: Focus, home_visible: bool, session_count: usize, delta: i32) -> Focus {
+    let entries = visible_entries(home_visible, session_count);
+    if entries.is_empty() {
+        return focus;
+    }
+    let pos = entries.iter().position(|&e| e == focus).unwrap_or(0);
+    let n = entries.len() as i32;
+    let new_pos = ((pos as i32 + delta).rem_euclid(n)) as usize;
+    entries[new_pos]
+}
+
+/// Compute the new focus after hiding Home.
+/// If sessions exist, moves to Session(0). Otherwise stays at Home (hidden state,
+/// but callers should keep focus at Session(0) guarded by emptiness checks).
+pub fn hide_home_focus(session_count: usize) -> Focus {
+    if session_count > 0 {
+        Focus::Session(0)
+    } else {
+        // No sessions and Home is hidden — best we can do is Session(0) which
+        // the render layer will handle gracefully (shows "no session" hint).
+        Focus::Session(0)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub struct App {
     pub should_quit: bool,
     pub manager: SessionManager,
     /// All active sessions in creation order: (id, live pty).
     pub sessions: Vec<(String, PtySession)>,
-    /// Index into `sessions` for the currently focused session.
-    pub focused: usize,
+    /// Current focus: either Home or a session by index.
+    pub focus: Focus,
+    /// Whether the Home pane is shown in the sidebar.
+    pub home_visible: bool,
     /// When Some, we're in path-input mode (new-session prompt).
     pub input: Option<String>,
     pub leader: bool, // Ctrl-a pressed, awaiting command
@@ -36,7 +87,8 @@ impl App {
             should_quit: false,
             manager: SessionManager::default(),
             sessions: Vec::new(),
-            focused: 0,
+            focus: Focus::Home,
+            home_visible: true,
             input: None,
             leader: false,
             claude_path: pty::resolve_claude_path(),
@@ -56,11 +108,7 @@ impl App {
             }
         });
 
-        // Start one session on launch (in the current dir) if claude is present.
-        let size = terminal.size()?;
-        let (rows, cols) = pane_dims(size.width, size.height);
-        self.start_session(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")), rows, cols);
-
+        // Launch on Home — do NOT auto-start a session.
         terminal.draw(|f| ui::draw(f, self))?;
         while !self.should_quit {
             match self.rx.recv() {
@@ -70,12 +118,15 @@ impl App {
                 Ok(AppEvent::Output) => {}
                 Ok(AppEvent::Exited { id, clean }) => {
                     self.manager.set_state(&id, if clean { SessionState::Closed } else { SessionState::Error });
-                    // Leave exited sessions visible; quit only when nothing live remains.
+                    // Leave exited sessions visible; only quit when nothing live remains
+                    // AND we're not on Home.
                     let any_live = self.sessions.iter().any(|(sid, _)| matches!(
                         self.manager.get(sid).map(|s| s.state),
                         Some(SessionState::Running) | Some(SessionState::Starting)
                     ));
-                    if !any_live { self.should_quit = true; }
+                    if !any_live && !self.home_visible && self.sessions.is_empty() {
+                        self.should_quit = true;
+                    }
                 }
                 Err(_) => break,
             }
@@ -91,49 +142,58 @@ impl App {
         match pty::spawn(&path, &cwd, rows, cols, id.clone(), self.tx.clone()) {
             Ok(pty) => {
                 self.manager.set_state(&id, SessionState::Running);
-                self.focused = self.sessions.len(); // new session becomes focused
+                let new_index = self.sessions.len();
                 self.sessions.push((id, pty));
+                self.focus = Focus::Session(new_index); // new session becomes focused
             }
             Err(_) => {
                 self.manager.set_state(&id, SessionState::Error);
-                // Can't build a PtySession without a live PTY; manager entry stays Error.
             }
         }
     }
 
     /// Returns the id of the currently focused session, if any.
     pub fn focused_id(&self) -> Option<String> {
-        self.sessions.get(self.focused).map(|(id, _)| id.clone())
-    }
-
-    /// Kill the focused session: signal the process, remove from manager + vec, clamp focused.
-    fn kill_focused(&mut self) {
-        if self.sessions.is_empty() { return; }
-        let (id, mut pty) = self.sessions.remove(self.focused);
-        // Signal the child to exit.
-        let _ = pty.killer.kill();
-        // Remove from the session manager.
-        self.manager.remove(&id);
-        // Clamp focused so it's still a valid index (or 0 if the list is empty).
-        if !self.sessions.is_empty() {
-            self.focused = self.focused.min(self.sessions.len() - 1);
+        if let Focus::Session(i) = self.focus {
+            self.sessions.get(i).map(|(id, _)| id.clone())
         } else {
-            self.focused = 0;
+            None
         }
     }
 
-    /// Resize the focused session's master PTY and vt100 parser to match the
-    /// current pane dimensions. Call this after switching focus.
+    /// Kill the focused session: signal the process, remove from manager + vec,
+    /// update focus to a safe state.
+    fn kill_focused(&mut self) {
+        let Focus::Session(i) = self.focus else { return };
+        if self.sessions.is_empty() { return; }
+        let (id, mut pty) = self.sessions.remove(i);
+        let _ = pty.killer.kill();
+        self.manager.remove(&id);
+        // Move focus to a safe state.
+        if !self.sessions.is_empty() {
+            let clamped = i.min(self.sessions.len() - 1);
+            self.focus = Focus::Session(clamped);
+        } else if self.home_visible {
+            self.focus = Focus::Home;
+        } else {
+            // No sessions, Home hidden — show Home again as a safety net.
+            self.home_visible = true;
+            self.focus = Focus::Home;
+        }
+    }
+
+    /// Resize the focused session's master PTY and vt100 parser.
     fn sync_focus_size(&mut self) {
-        // We need to know the terminal size. We don't store it, so we query it.
-        // crossterm::terminal::size() returns the full terminal size.
-        if let Ok((term_w, term_h)) = crossterm::terminal::size() {
-            let (rows, cols) = pane_dims(term_w, term_h);
-            if let Some((_, pty)) = self.sessions.get(self.focused) {
-                let _ = pty.master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
-                pty.parser.lock().unwrap().set_size(rows, cols);
+        if let Focus::Session(i) = self.focus {
+            if let Ok((term_w, term_h)) = crossterm::terminal::size() {
+                let (rows, cols) = pane_dims(term_w, term_h);
+                if let Some((_, pty)) = self.sessions.get(i) {
+                    let _ = pty.master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                    pty.parser.lock().unwrap().set_size(rows, cols);
+                }
             }
         }
+        // Home needs no PTY resize.
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -155,25 +215,34 @@ impl App {
                             .unwrap_or_default(),
                     );
                 }
-                KeyCode::Char('x') => self.kill_focused(),
+                KeyCode::Char('h') => {
+                    self.home_visible = true;
+                    self.focus = Focus::Home;
+                }
+                KeyCode::Char('x') => {
+                    match self.focus {
+                        Focus::Home => {
+                            // Hide the Home pane.
+                            self.home_visible = false;
+                            self.focus = hide_home_focus(self.sessions.len());
+                        }
+                        Focus::Session(_) => self.kill_focused(),
+                    }
+                }
                 KeyCode::Char(c @ '1'..='9') => {
                     let i = (c as u8 - b'1') as usize;
                     if i < self.sessions.len() {
-                        self.focused = i;
+                        self.focus = Focus::Session(i);
                         self.sync_focus_size();
                     }
                 }
                 KeyCode::Char('[') => {
-                    if !self.sessions.is_empty() {
-                        self.focused = (self.focused + self.sessions.len() - 1) % self.sessions.len();
-                        self.sync_focus_size();
-                    }
+                    self.focus = cycle_focus(self.focus, self.home_visible, self.sessions.len(), -1);
+                    self.sync_focus_size();
                 }
                 KeyCode::Char(']') => {
-                    if !self.sessions.is_empty() {
-                        self.focused = (self.focused + 1) % self.sessions.len();
-                        self.sync_focus_size();
-                    }
+                    self.focus = cycle_focus(self.focus, self.home_visible, self.sessions.len(), 1);
+                    self.sync_focus_size();
                 }
                 _ => {}
             }
@@ -185,11 +254,13 @@ impl App {
             return;
         }
 
-        // Otherwise forward to the focused session.
-        if let Some((_, pty)) = self.sessions.get_mut(self.focused) {
-            if let Some(bytes) = keys::encode(&key) {
-                let _ = pty.writer.write_all(&bytes);
-                let _ = pty.writer.flush();
+        // Forward to the focused session (Home doesn't accept input).
+        if let Focus::Session(i) = self.focus {
+            if let Some((_, pty)) = self.sessions.get_mut(i) {
+                if let Some(bytes) = keys::encode(&key) {
+                    let _ = pty.writer.write_all(&bytes);
+                    let _ = pty.writer.flush();
+                }
             }
         }
     }
@@ -209,8 +280,7 @@ impl App {
                             self.start_session(path, rows, cols);
                         }
                     }
-                    // If the path is not a valid directory, close the prompt
-                    // without creating a session (silently cancel).
+                    // If not a valid directory, close the prompt without creating a session.
                 }
             }
             KeyCode::Backspace => {
@@ -228,10 +298,13 @@ impl App {
     }
 
     fn on_resize(&mut self, w: u16, h: u16) {
-        let (rows, cols) = pane_dims(w, h);
-        if let Some((_, pty)) = self.sessions.get(self.focused) {
-            let _ = pty.master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
-            pty.parser.lock().unwrap().set_size(rows, cols);
+        // Only resize the focused session's PTY; Home needs no resize.
+        if let Focus::Session(i) = self.focus {
+            let (rows, cols) = pane_dims(w, h);
+            if let Some((_, pty)) = self.sessions.get(i) {
+                let _ = pty.master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                pty.parser.lock().unwrap().set_size(rows, cols);
+            }
         }
     }
 }
@@ -242,4 +315,93 @@ pub fn pane_dims(term_w: u16, term_h: u16) -> (u16, u16) {
     let cols = term_w.saturating_sub(26).saturating_sub(2).max(1);
     let rows = term_h.saturating_sub(2).max(1);
     (rows, cols)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── visible_entries ───────────────────────────────────────────────────────
+
+    #[test]
+    fn visible_entries_home_visible_includes_home_first() {
+        let v = visible_entries(true, 2);
+        assert_eq!(v, vec![Focus::Home, Focus::Session(0), Focus::Session(1)]);
+    }
+
+    #[test]
+    fn visible_entries_home_hidden_excludes_home() {
+        let v = visible_entries(false, 2);
+        assert_eq!(v, vec![Focus::Session(0), Focus::Session(1)]);
+    }
+
+    #[test]
+    fn visible_entries_no_sessions_home_visible() {
+        let v = visible_entries(true, 0);
+        assert_eq!(v, vec![Focus::Home]);
+    }
+
+    #[test]
+    fn visible_entries_empty_when_home_hidden_no_sessions() {
+        let v = visible_entries(false, 0);
+        assert!(v.is_empty());
+    }
+
+    // ── cycle_focus ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn cycle_forward_wraps_home_sessions() {
+        // [Home, S0, S1] forward from S1 → Home
+        assert_eq!(cycle_focus(Focus::Session(1), true, 2, 1), Focus::Home);
+    }
+
+    #[test]
+    fn cycle_backward_wraps_home_sessions() {
+        // [Home, S0, S1] backward from Home → S1
+        assert_eq!(cycle_focus(Focus::Home, true, 2, -1), Focus::Session(1));
+    }
+
+    #[test]
+    fn cycle_forward_home_to_s0() {
+        assert_eq!(cycle_focus(Focus::Home, true, 2, 1), Focus::Session(0));
+    }
+
+    #[test]
+    fn cycle_home_skipped_when_hidden() {
+        // [S0, S1] forward from S1 → S0 (Home not in list)
+        assert_eq!(cycle_focus(Focus::Session(1), false, 2, 1), Focus::Session(0));
+    }
+
+    #[test]
+    fn cycle_home_skipped_backward_when_hidden() {
+        // [S0, S1] backward from S0 → S1
+        assert_eq!(cycle_focus(Focus::Session(0), false, 2, -1), Focus::Session(1));
+    }
+
+    #[test]
+    fn cycle_single_entry_stays_put() {
+        // Only Home visible, no sessions — stays Home
+        assert_eq!(cycle_focus(Focus::Home, true, 0, 1), Focus::Home);
+        assert_eq!(cycle_focus(Focus::Home, true, 0, -1), Focus::Home);
+    }
+
+    #[test]
+    fn cycle_no_entries_returns_current() {
+        // Home hidden, no sessions — returns current unchanged
+        assert_eq!(cycle_focus(Focus::Session(0), false, 0, 1), Focus::Session(0));
+    }
+
+    // ── hide_home_focus ───────────────────────────────────────────────────────
+
+    #[test]
+    fn hide_home_with_sessions_moves_to_session_0() {
+        assert_eq!(hide_home_focus(3), Focus::Session(0));
+    }
+
+    #[test]
+    fn hide_home_no_sessions_returns_session_0_safely() {
+        // With no sessions, we return Session(0) — the render layer handles empty gracefully.
+        assert_eq!(hide_home_focus(0), Focus::Session(0));
+    }
 }

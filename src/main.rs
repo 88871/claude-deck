@@ -1,4 +1,6 @@
 mod app;
+mod keys;
+mod pty;
 mod session;
 mod ui;
 

@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
@@ -8,21 +8,9 @@ use ratatui::{
 use tui_term::widget::PseudoTerminal;
 use crate::app::{App, Focus};
 use crate::home;
+use crate::icons;
 use crate::mouse::SIDEBAR_WIDTH;
 use crate::session::SessionState;
-
-fn glyph(state: SessionState) -> &'static str {
-    use SessionState::*;
-    match state {
-        Starting    => "○",
-        Running     => "⏳",
-        WaitingOnYou => "◍",
-        Idle        => "✓",
-        Parked      => "◌",
-        Closed      => "⏹",
-        Error       => "✗",
-    }
-}
 
 pub fn draw(f: &mut Frame, app: &App) {
     // ── Outer horizontal split: sidebar | main ──────────────────────────────
@@ -37,14 +25,15 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let mut items: Vec<ListItem> = Vec::new();
 
-    // ⌂ Home row (shown when home_visible).
+    // Home row (shown when home_visible).
     if app.home_visible {
-        let style = if app.focus == Focus::Home {
+        let row_style = if app.focus == Focus::Home {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
             Style::default()
         };
-        items.push(ListItem::new(Line::from(vec![Span::styled("⌂ Home", style)])));
+        let label = format!("{} Home", icons::home(app.icons));
+        items.push(ListItem::new(Line::from(vec![Span::styled(label, row_style)])));
     }
 
     // Session rows.
@@ -54,14 +43,25 @@ pub fn draw(f: &mut Frame, app: &App) {
             .map(|s| (s.label.clone(), s.state))
             .unwrap_or_else(|| (id[..8.min(id.len())].to_string(), SessionState::Error));
 
-        let g = glyph(state);
-        let text = format!("{} {}", g, label);
-        let style = if app.focus == Focus::Session(i) {
+        let g = icons::state(state, app.icons);
+        let glyph_color: Color = icons::state_color(state);
+
+        let focused = app.focus == Focus::Session(i);
+        let glyph_style = if focused {
+            Style::default().fg(glyph_color).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(glyph_color)
+        };
+        let label_style = if focused {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
             Style::default()
         };
-        items.push(ListItem::new(Line::from(vec![Span::styled(text, style)])));
+
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(g, glyph_style),
+            Span::styled(format!(" {}", label), label_style),
+        ])));
     }
 
     if items.is_empty() {
@@ -90,7 +90,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             // Show current pane (Home or session) behind the input prompt.
             match app.focus {
                 Focus::Home => {
-                    home::render(f, vsplit[0], app.sessions.len());
+                    home::render(f, vsplit[0], app.sessions.len(), app.icons);
                 }
                 Focus::Session(i) => {
                     if let Some((_, pty)) = app.sessions.get(i) {
@@ -122,7 +122,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         // Normal: render Home or the focused session.
         match app.focus {
             Focus::Home => {
-                home::render(f, chunks[1], app.sessions.len());
+                home::render(f, chunks[1], app.sessions.len(), app.icons);
             }
             Focus::Session(i) => {
                 if let Some((_, pty)) = app.sessions.get(i) {

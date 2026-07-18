@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crate::icons::{self, IconMode};
 use crate::pty::{self, PtySession};
 use crate::session::{SessionManager, SessionState};
 use crate::{keys, mouse, ui, Tui};
@@ -63,6 +64,7 @@ pub struct App {
     pub input: Option<String>,
     pub leader: bool, // Ctrl-a pressed, awaiting command
     pub claude_path: Option<String>,
+    pub icons: IconMode,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
 }
@@ -79,6 +81,7 @@ impl App {
             input: None,
             leader: false,
             claude_path: pty::resolve_claude_path(),
+            icons: icons::detect_mode(),
             tx,
             rx,
         }

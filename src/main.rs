@@ -1,5 +1,6 @@
 mod app;
 mod home;
+mod icons;
 mod keys;
 mod mouse;
 mod pty;

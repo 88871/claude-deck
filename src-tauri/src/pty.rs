@@ -50,6 +50,9 @@ pub fn spawn_claude(
 
     let mut cmd = CommandBuilder::new(claude_path);
     cmd.cwd(cwd);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("LANG", "en_US.UTF-8");
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);

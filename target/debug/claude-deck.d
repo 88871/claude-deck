@@ -1,1 +1,0 @@
-/Users/m/Desktop/claude-deck/target/debug/claude-deck: /Users/m/Desktop/claude-deck/src/app.rs /Users/m/Desktop/claude-deck/src/keys.rs /Users/m/Desktop/claude-deck/src/main.rs /Users/m/Desktop/claude-deck/src/pty.rs /Users/m/Desktop/claude-deck/src/session.rs /Users/m/Desktop/claude-deck/src/ui.rs

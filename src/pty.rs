@@ -9,9 +9,12 @@ use crate::app::AppEvent;
 pub struct PtySession {
     pub writer: Box<dyn Write + Send>,
     pub master: Box<dyn MasterPty + Send>,
-    #[allow(dead_code)] // used by later reaping/kill work
     pub killer: Box<dyn ChildKiller + Send + Sync>,
     pub parser: Arc<Mutex<vt100::Parser>>,
+    /// OS process ID of the child `claude` process; `None` if the platform
+    /// doesn't expose it.  Captured **before** the child moves to the waiter
+    /// thread so the waiter's `move` closure doesn't take it first.
+    pub pid: Option<u32>,
 }
 
 /// Resolve the path to the `claude` binary.
@@ -65,6 +68,8 @@ pub fn spawn(
     let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
     drop(pair.slave);
     let killer = child.clone_killer();
+    // Capture the pid BEFORE the child moves into the waiter thread.
+    let pid: Option<u32> = child.process_id();
 
     let mut reader = pair.master.try_clone_reader().map_err(to_io)?;
     let writer = pair.master.take_writer().map_err(to_io)?;
@@ -93,7 +98,7 @@ pub fn spawn(
         let _ = tx.send(AppEvent::Exited { id, clean });
     });
 
-    Ok(PtySession { writer, master: pair.master, killer, parser })
+    Ok(PtySession { writer, master: pair.master, killer, parser, pid })
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {

@@ -1,10 +1,12 @@
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crate::icons::{self, IconMode};
+use crate::mem::{self, Mem};
 use crate::pty::{self, PtySession};
 use crate::session::{SessionManager, SessionState};
 use crate::{keys, mouse, ui, Tui};
@@ -14,6 +16,8 @@ pub enum AppEvent {
     Output,
     Exited { id: String, clean: bool },
     Hook(crate::hooks::HookEvent),
+    /// Fired by the timer thread every ~10 seconds.
+    Tick,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -95,6 +99,28 @@ pub struct App {
     settings_path: std::path::PathBuf,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
+
+    // ── R2: memory monitor + opt-in idle park ──────────────────────────────
+
+    /// RSS warning threshold in KB. `None` disables the warning entirely
+    /// (set when `--mem-warn 0` is passed; default: 4096 MB = 4_194_304 KB).
+    pub mem_warn_kb: Option<u64>,
+    /// When `true` (set by `--reap-idle`), sessions that are Idle + unfocused
+    /// + unpinned + timed-out are automatically parked. Default: `false`.
+    pub reap_idle: bool,
+    /// How long a session must be continuously Idle before it is parked
+    /// (only when `reap_idle` is `true`). Default: 600 s.
+    pub reap_timeout: Duration,
+    /// When a session first became Idle (cleared when it leaves Idle, is
+    /// focused, or receives input).
+    pub idle_since: HashMap<String, Instant>,
+    /// Last-measured RSS (KB) for each live session; used by the sidebar UI.
+    pub rss: HashMap<String, u64>,
+    /// Sessions that have already triggered the high-memory warning this
+    /// crossing (reset once rss drops back below the threshold).
+    pub warned: HashSet<String>,
+    /// sysinfo wrapper for per-process memory queries.
+    mem_sys: Mem,
 }
 
 impl App {
@@ -113,11 +139,30 @@ impl App {
         // pick it up. Best-effort — if it fails, hooks just won't fire.
         let _ = crate::hooks::write_settings_file(&settings_path, &port.to_string());
 
-        // Parse --no-bell / --no-notify flags from this process's args.
+        // Parse flags from this process's args.
         // This is the TUI path only — __hook is handled before App::new().
         let args: Vec<String> = std::env::args().collect();
         let bell_on = !args.contains(&"--no-bell".to_string());
         let notify_on = !args.contains(&"--no-notify".to_string());
+        let reap_idle = args.contains(&"--reap-idle".to_string());
+
+        // --mem-warn <MB>  (default 4096; 0 = disable)
+        let mem_warn_kb: Option<u64> = {
+            let mb = args.windows(2)
+                .find(|w| w[0] == "--mem-warn")
+                .and_then(|w| w[1].parse::<u64>().ok())
+                .unwrap_or(4096);
+            if mb == 0 { None } else { Some(mb * 1024) }
+        };
+
+        // --reap-timeout <secs>  (default 600)
+        let reap_timeout = {
+            let secs = args.windows(2)
+                .find(|w| w[0] == "--reap-timeout")
+                .and_then(|w| w[1].parse::<u64>().ok())
+                .unwrap_or(600);
+            Duration::from_secs(secs)
+        };
 
         Self {
             should_quit: false,
@@ -134,6 +179,13 @@ impl App {
             settings_path,
             tx,
             rx,
+            mem_warn_kb,
+            reap_idle,
+            reap_timeout,
+            idle_since: HashMap::new(),
+            rss: HashMap::new(),
+            warned: HashSet::new(),
+            mem_sys: Mem::new(),
         }
     }
 
@@ -146,6 +198,13 @@ impl App {
                     if input_tx.send(AppEvent::Input(ev)).is_err() { break; }
                 }
             }
+        });
+
+        // Timer thread: send Tick every ~10 s for RSS polling + idle parking.
+        let tick_tx = self.tx.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(10));
+            if tick_tx.send(AppEvent::Tick).is_err() { break; }
         });
 
         // Launch on Home — do NOT auto-start a session.
@@ -175,6 +234,14 @@ impl App {
                         let old_state = self.manager.get(&ev.session_id).map(|s| s.state);
                         self.manager.set_state(&ev.session_id, new_state);
 
+                        // ── Idle tracking ─────────────────────────────────
+                        if new_state == SessionState::Idle {
+                            self.idle_since.entry(ev.session_id.clone()).or_insert_with(Instant::now);
+                        } else {
+                            // Leaving Idle (any non-Idle hook) clears the timer.
+                            self.idle_since.remove(&ev.session_id);
+                        }
+
                         // Fire attention signals on the WaitingOnYou transition edge,
                         // but only when this session is NOT the currently focused one.
                         if new_state == SessionState::WaitingOnYou
@@ -200,6 +267,7 @@ impl App {
                         }
                     }
                 }
+                Ok(AppEvent::Tick) => self.on_tick(),
                 Err(_) => break,
             }
             terminal.draw(|f| ui::draw(f, self))?;
@@ -292,6 +360,10 @@ impl App {
     /// Resize the focused session's master PTY and vt100 parser.
     fn sync_focus_size(&mut self) {
         if let Focus::Session(i) = self.focus {
+            // Clear idle timer for the newly-focused session.
+            if let Some((id, _)) = self.sessions.get(i) {
+                self.idle_since.remove(id);
+            }
             if let Ok((term_w, term_h)) = crossterm::terminal::size() {
                 let (rows, cols) = pane_dims(term_w, term_h);
                 if let Some((_, Some(pty))) = self.sessions.get(i) {
@@ -302,6 +374,92 @@ impl App {
             }
         }
         // Home needs no PTY resize.
+    }
+
+    /// Park the session with the given id: kill its process, set its PTY slot
+    /// to `None`, mark the session as `Parked`, and clear its idle timer.
+    ///
+    /// **Safety gate:** only ever called from `on_tick` for sessions that are
+    /// confirmed Idle + unfocused + unpinned + timed-out.  Never called on an
+    /// active (Running/WaitingOnYou/Starting) session.
+    fn park_session(&mut self, id: &str) {
+        if let Some((_, pty_slot)) = self.sessions.iter_mut().find(|(sid, _)| sid == id) {
+            if let Some(mut pty) = pty_slot.take() {
+                let _ = pty.killer.kill(); // best-effort
+            }
+            // pty_slot is already None after take()
+        }
+        self.manager.set_state(id, SessionState::Parked);
+        self.idle_since.remove(id);
+    }
+
+    /// Tick handler: measure RSS for every live session, fire memory warnings
+    /// (edge-triggered), and — when `--reap-idle` is set — park sessions that
+    /// qualify via `should_park`.
+    fn on_tick(&mut self) {
+        // Collect (id, pid) pairs for live sessions up front to avoid
+        // borrowing `self.sessions` and `self.mem_sys` simultaneously.
+        let live: Vec<(String, u32)> = self.sessions.iter()
+            .filter_map(|(id, pty_opt)| {
+                pty_opt.as_ref().and_then(|pty| pty.pid).map(|pid| (id.clone(), pid))
+            })
+            .collect();
+
+        for (id, pid) in &live {
+            if let Some(kb) = self.mem_sys.rss_kb(*pid) {
+                self.rss.insert(id.clone(), kb);
+
+                // Edge-triggered memory warning: fire only on the first Tick
+                // that crosses the threshold; re-arm once rss drops back below.
+                if let Some(warn_kb) = self.mem_warn_kb {
+                    if kb >= warn_kb {
+                        if !self.warned.contains(id) {
+                            self.warned.insert(id.clone());
+                            let label = self.manager.get(id)
+                                .map(|s| s.label.clone())
+                                .unwrap_or_else(|| id.clone());
+                            crate::notify::desktop(&format!(
+                                "{} is using {} — consider restarting",
+                                label,
+                                mem::fmt_kb(kb)
+                            ));
+                        }
+                    } else {
+                        // Below threshold — re-arm for the next crossing.
+                        self.warned.remove(id);
+                    }
+                }
+            }
+        }
+
+        // Opt-in idle parking.
+        if self.reap_idle {
+            let timeout = self.reap_timeout;
+            let now = Instant::now();
+
+            // Collect ids to park (avoid borrow conflicts).
+            let to_park: Vec<String> = self.sessions.iter().enumerate()
+                .filter_map(|(idx, (id, pty_opt))| {
+                    // Only live sessions can be parked.
+                    if pty_opt.is_none() { return None; }
+
+                    let state = self.manager.get(id)?.state;
+                    let focused = self.focus == Focus::Session(idx);
+                    let pinned = self.manager.get(id).map(|s| s.pinned).unwrap_or(false);
+                    let idle_for = self.idle_since.get(id).map(|t| now.duration_since(*t))?;
+
+                    if mem::should_park(true, state, focused, pinned, idle_for, timeout) {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for id in to_park {
+                self.park_session(&id);
+            }
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -388,8 +546,12 @@ impl App {
 
         // Forward to the focused session (Home and parked sessions don't accept input).
         if let Focus::Session(i) = self.focus {
-            if let Some((_, Some(pty))) = self.sessions.get_mut(i) {
-                if let Some(bytes) = keys::encode(&key) {
+            if let Some(bytes) = keys::encode(&key) {
+                // Input resets the idle timer for this session.
+                if let Some((id, _)) = self.sessions.get(i) {
+                    self.idle_since.remove(id);
+                }
+                if let Some((_, Some(pty))) = self.sessions.get_mut(i) {
                     let _ = pty.writer.write_all(&bytes);
                     let _ = pty.writer.flush();
                 }

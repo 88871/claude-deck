@@ -3,6 +3,7 @@ pub mod home;
 pub mod hooks;
 pub mod icons;
 pub mod keys;
+pub mod mem;
 pub mod mouse;
 pub mod notify;
 pub mod pty;

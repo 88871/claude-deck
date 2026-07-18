@@ -136,6 +136,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Some(Prompt::Rename(s))     => ("rename session: ",   s.as_str()),
             Some(Prompt::ConfirmRestart(_)) | Some(Prompt::EditSetting { .. }) | None => ("", ""),
         };
+        let is_new_session = matches!(&app.prompt, Some(Prompt::NewSession(_)));
 
         if inner.height > 1 {
             let vsplit = Layout::default()
@@ -172,11 +173,18 @@ pub fn draw(f: &mut Frame, app: &App) {
             }
 
             // Input line.
-            let prompt_text = Text::from(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(prefix),
                 Span::raw(buf),
                 Span::raw("_"),
-            ]));
+            ];
+            if is_new_session {
+                spans.push(Span::styled(
+                    "  Enter start · Tab complete · Ctrl-r resume here",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            let prompt_text = Text::from(Line::from(spans));
             f.render_widget(Paragraph::new(prompt_text), vsplit[1]);
         } else {
             // Terminal too small; just show the input line.
@@ -554,9 +562,14 @@ fn draw_settings_view_with_edit(f: &mut Frame, area: Rect, app: &App) {
 
 /// Render the resume-picker view into `area`.
 pub fn draw_resume_picker(f: &mut Frame, area: Rect, app: &App) {
+    // Title changes when scoped to a directory.
+    let title = match &app.resume_scope {
+        Some(path) => format!("Resume in {}", path.display()),
+        None => "Resume a past conversation".to_string(),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Resume a past conversation");
+        .title(title.as_str());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -611,9 +624,16 @@ pub fn draw_resume_picker(f: &mut Frame, area: Rect, app: &App) {
     let list_area = vsplit[2];
 
     if filtered.is_empty() {
+        // Show a context-aware empty message.
+        let empty_msg = match &app.resume_scope {
+            Some(path) if app.resume_items.is_empty() => {
+                format!("no past conversations in {}", path.display())
+            }
+            _ => "(no matches)".to_string(),
+        };
         f.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
-                "(no matches)",
+                empty_msg,
                 Style::default().fg(Color::DarkGray),
             )])),
             list_area,

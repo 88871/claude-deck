@@ -76,6 +76,60 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Parse a single `.jsonl` session file at `path` into a `Past`, or `None`
+/// if the file cannot be read, has no `cwd`, or the id cannot be determined.
+///
+/// Extracted so that both `scan_in` and `scan_for_cwd_in` can reuse it.
+fn parse_session_file(path: &Path, mtime: SystemTime) -> Option<Past> {
+    // id = filename stem (UUID).
+    let id = path.file_stem().and_then(|s| s.to_str())?.to_string();
+
+    let content = std::fs::read_to_string(path).ok()?;
+
+    let mut cwd_opt: Option<PathBuf> = None;
+    let mut title_opt: Option<String> = None;
+
+    // Read up to ~40 lines.
+    for line in content.lines().take(40) {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Try to pick up a cwd field.
+        if cwd_opt.is_none() {
+            if let Some(c) = get_str_field(line, "cwd") {
+                cwd_opt = Some(PathBuf::from(c));
+            }
+        }
+
+        // Try to pick up the first user message as the title.
+        if title_opt.is_none() {
+            if let Some(t) = extract_user_title(line) {
+                title_opt = Some(t);
+            }
+        }
+
+        if cwd_opt.is_some() && title_opt.is_some() {
+            break;
+        }
+    }
+
+    // Skip files with no cwd — we cannot resume without knowing where to run.
+    let cwd = cwd_opt?;
+
+    // Title fallback: last component of cwd.
+    let raw_title = title_opt.unwrap_or_else(|| {
+        cwd.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(unknown)")
+            .to_string()
+    });
+
+    let title = truncate(&raw_title, 60);
+
+    Some(Past { id, cwd, title, mtime })
+}
+
 /// Core scanner.  Exposed separately so tests can point at a temp dir.
 pub fn scan_in(base: &Path, limit: usize) -> Vec<Past> {
     // Collect all *.jsonl files under base/*/*.jsonl
@@ -114,65 +168,91 @@ pub fn scan_in(base: &Path, limit: usize) -> Vec<Past> {
     let mut results: Vec<Past> = Vec::new();
 
     for (path, mtime) in files {
-        // id = filename stem (UUID).
-        let id = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let mut cwd_opt: Option<PathBuf> = None;
-        let mut title_opt: Option<String> = None;
-
-        // Read up to ~40 lines.
-        for line in content.lines().take(40) {
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            // Try to pick up a cwd field.
-            if cwd_opt.is_none() {
-                if let Some(c) = get_str_field(line, "cwd") {
-                    cwd_opt = Some(PathBuf::from(c));
-                }
-            }
-
-            // Try to pick up the first user message as the title.
-            if title_opt.is_none() {
-                if let Some(t) = extract_user_title(line) {
-                    title_opt = Some(t);
-                }
-            }
-
-            if cwd_opt.is_some() && title_opt.is_some() {
-                break;
-            }
+        if let Some(past) = parse_session_file(&path, mtime) {
+            results.push(past);
         }
-
-        // Skip files with no cwd — we cannot resume without knowing where to run.
-        let cwd = match cwd_opt {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // Title fallback: last component of cwd.
-        let raw_title = title_opt.unwrap_or_else(|| {
-            cwd.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("(unknown)")
-                .to_string()
-        });
-
-        let title = truncate(&raw_title, 60);
-
-        results.push(Past { id, cwd, title, mtime });
     }
 
     results
+}
+
+// ── Directory-scoped resume ───────────────────────────────────────────────────
+
+/// Encode a cwd path to the project directory name that Claude Code uses:
+/// replace every `/` and `.` in the path string with `-`.
+fn encode_cwd(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// Normalise a path string for cwd comparison: strip a single trailing `/`
+/// so that `/tmp/foo` and `/tmp/foo/` compare equal.
+fn norm_cwd(s: &str) -> &str {
+    s.trim_end_matches('/')
+}
+
+/// Testable core: scan `base/<encoded_cwd>/*.jsonl`, keep only sessions whose
+/// internal `cwd` field matches `cwd`, sort by mtime DESC, return up to `limit`.
+///
+/// `base` is the projects root (normally `~/.claude/projects`).
+pub fn scan_for_cwd_in(base: &Path, cwd: &Path, limit: usize) -> Vec<Past> {
+    // Normalise: strip trailing separators before encoding so that
+    // `/tmp/foo` and `/tmp/foo/` map to the same project directory.
+    let cwd_str = cwd.to_string_lossy();
+    let cwd_norm = norm_cwd(&cwd_str);
+    let encoded = encode_cwd(Path::new(cwd_norm));
+    let proj_dir = base.join(&encoded);
+
+    let dir_iter = match std::fs::read_dir(&proj_dir) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
+    let target_norm = cwd_norm;
+
+    let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for entry in dir_iter.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            let mtime = p
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            files.push((p, mtime));
+        }
+    }
+
+    // Sort newest-first before parsing so we can stop early.
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut results: Vec<Past> = Vec::new();
+    for (path, mtime) in files {
+        if let Some(past) = parse_session_file(&path, mtime) {
+            // Guard against encoding collisions: verify the internal cwd matches.
+            let internal = past.cwd.to_string_lossy();
+            if norm_cwd(&internal) == target_norm {
+                results.push(past);
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Public entry point: scan `~/.claude/projects/<encoded_cwd>` and return up
+/// to `limit` past sessions for that specific directory, newest first.
+/// Returns an empty vec if the projects dir is missing or there is no history.
+pub fn scan_for_cwd(cwd: &Path, limit: usize) -> Vec<Past> {
+    let base = match dirs::home_dir() {
+        Some(h) => h.join(".claude/projects"),
+        None => return Vec::new(),
+    };
+    scan_for_cwd_in(&base, cwd, limit)
 }
 
 // ── Relative time formatter ───────────────────────────────────────────────────
@@ -381,5 +461,71 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mtime = now + Duration::from_secs(60);
         assert_eq!(rel_time(mtime, now), "just now");
+    }
+
+    // ── scan_for_cwd_in ───────────────────────────────────────────────────────
+
+    #[test]
+    fn scan_for_cwd_in_returns_matching_session() {
+        let base = make_base();
+        // Claude encodes /tmp/foo → -tmp-foo
+        let proj = base.join("-tmp-foo");
+        std::fs::create_dir_all(&proj).unwrap();
+        let uuid = "cccccccc-0000-0000-0000-000000000001";
+        let file = proj.join(format!("{}.jsonl", uuid));
+        write_jsonl(&file, &[
+            r#"{"cwd":"/tmp/foo","type":"x"}"#,
+            r#"{"type":"user","message":{"content":"scoped session"}}"#,
+        ]);
+
+        let results = scan_for_cwd_in(&base, std::path::Path::new("/tmp/foo"), 50);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, uuid);
+        assert_eq!(results[0].cwd, PathBuf::from("/tmp/foo"));
+        assert_eq!(results[0].title, "scoped session");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_for_cwd_in_different_cwd_returns_empty() {
+        let base = make_base();
+        let proj = base.join("-tmp-foo");
+        std::fs::create_dir_all(&proj).unwrap();
+        let uuid = "cccccccc-0000-0000-0000-000000000002";
+        let file = proj.join(format!("{}.jsonl", uuid));
+        write_jsonl(&file, &[r#"{"cwd":"/tmp/foo","type":"x"}"#]);
+
+        // Looking for /tmp/bar — different cwd → empty.
+        let results = scan_for_cwd_in(&base, std::path::Path::new("/tmp/bar"), 50);
+        assert_eq!(results.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_for_cwd_in_missing_dir_returns_empty() {
+        let base = make_base();
+        // Don't create any subdirectory — should return empty without panicking.
+        let results = scan_for_cwd_in(&base, std::path::Path::new("/nonexistent/path"), 50);
+        assert_eq!(results.len(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_for_cwd_in_trailing_slash_is_ignored() {
+        let base = make_base();
+        let proj = base.join("-tmp-foo");
+        std::fs::create_dir_all(&proj).unwrap();
+        let uuid = "cccccccc-0000-0000-0000-000000000003";
+        let file = proj.join(format!("{}.jsonl", uuid));
+        // internal cwd has no trailing slash
+        write_jsonl(&file, &[r#"{"cwd":"/tmp/foo","type":"x"}"#]);
+
+        // Query with trailing slash → should still match.
+        let results = scan_for_cwd_in(&base, std::path::Path::new("/tmp/foo/"), 50);
+        assert_eq!(results.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

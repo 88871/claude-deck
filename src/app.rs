@@ -220,7 +220,7 @@ pub struct App {
     /// When false, the terminal's native text selection / copy works.
     pub mouse_on: bool,
 
-    // ── Resume picker (Ctrl-a o) ───────────────────────────────────────────
+    // ── Resume picker (Ctrl-a o / Ctrl-r) ────────────────────────────────
 
     /// Scanned past sessions for the resume picker.
     pub resume_items: Vec<resume::Past>,
@@ -228,6 +228,9 @@ pub struct App {
     pub resume_cursor: usize,
     /// Current filter string typed by the user.
     pub resume_filter: String,
+    /// When `Some(path)`, the picker is scoped to that directory.
+    /// `None` = global picker (Ctrl-a o).
+    pub resume_scope: Option<PathBuf>,
 }
 
 impl App {
@@ -345,6 +348,7 @@ impl App {
             resume_items: Vec::new(),
             resume_cursor: 0,
             resume_filter: String::new(),
+            resume_scope: None,
         };
 
         // If the persisted config has mouse disabled, turn off capture now.
@@ -855,10 +859,11 @@ impl App {
                     self.settings_cursor = 0;
                 }
                 KeyCode::Char('o') => {
-                    // Open the resume picker: scan past sessions and show the list.
+                    // Open the global resume picker: scan all past sessions.
                     self.resume_items = resume::scan(120);
                     self.resume_filter.clear();
                     self.resume_cursor = 0;
+                    self.resume_scope = None;
                     self.focus = Focus::ResumePicker;
                 }
                 KeyCode::Char('m') => {
@@ -921,6 +926,32 @@ impl App {
                         *b = completed;
                     }
                 }
+            }
+            return;
+        }
+
+        // Ctrl-r in the NewSession prompt: open the resume picker scoped to the
+        // typed path.  Expand a leading `~` before scanning.
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(Prompt::NewSession(ref buf)) = self.prompt {
+                let raw = buf.clone();
+                // Expand leading `~` to home dir.
+                let expanded: String = if raw.starts_with('~') {
+                    if let Some(home) = dirs::home_dir() {
+                        format!("{}{}", home.display(), &raw[1..])
+                    } else {
+                        raw.clone()
+                    }
+                } else {
+                    raw.clone()
+                };
+                let path = PathBuf::from(&expanded);
+                self.resume_items = resume::scan_for_cwd(&path, 200);
+                self.resume_scope = Some(path);
+                self.resume_filter.clear();
+                self.resume_cursor = 0;
+                self.prompt = None;
+                self.focus = Focus::ResumePicker;
             }
             return;
         }

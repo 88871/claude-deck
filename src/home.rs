@@ -24,7 +24,7 @@ pub fn render(f: &mut Frame, area: Rect, session_count: usize, icon_mode: IconMo
         Line::from(format!("{}  Ctrl-a  n     new session (pick a folder)", folder)).centered(),
         Line::from(format!("{}  Ctrl-a  h     back to this Home screen", folder)).centered(),
         Line::from(""),
-        Line::from("switch  Ctrl-a 1-9 / [ / ]    kill  Ctrl-a x    quit  Ctrl-a q")
+        Line::from("switch  Ctrl-a 1-9 / [ / ]    kill  Ctrl-a x    rename  Ctrl-a r    quit  Ctrl-a q")
             .style(Style::new().dim())
             .centered(),
         Line::from(""),

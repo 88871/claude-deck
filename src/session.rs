@@ -64,6 +64,13 @@ impl SessionManager {
         self.order.retain(|x| x != id);
         self.sessions.remove(id).is_some()
     }
+
+    pub fn rename(&mut self, id: &str, new_label: &str) -> bool {
+        match self.sessions.get_mut(id) {
+            Some(s) => { s.label = new_label.to_string(); true }
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -104,5 +111,19 @@ mod tests {
         assert!(m.remove(&id));
         assert!(m.get(&id).is_none());
         assert!(!m.remove(&id));
+    }
+
+    #[test]
+    fn rename_updates_known_session() {
+        let mut m = SessionManager::new();
+        let id = m.create(PathBuf::from("/tmp/project"));
+        assert!(m.rename(&id, "my-project"));
+        assert_eq!(m.get(&id).unwrap().label, "my-project");
+    }
+
+    #[test]
+    fn rename_rejects_unknown_id() {
+        let mut m = SessionManager::new();
+        assert!(!m.rename("nonexistent-id", "whatever"));
     }
 }

@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 use tui_term::widget::PseudoTerminal;
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, Prompt};
 use crate::home;
 use crate::icons;
 use crate::mouse::SIDEBAR_WIDTH;
@@ -76,10 +76,17 @@ pub fn draw(f: &mut Frame, app: &App) {
     // ── Main pane: split vertically for optional input line ──────────────────
     let main_block = Block::default().borders(Borders::ALL).title("claude-deck");
 
-    if app.input.is_some() {
+    if app.prompt.is_some() {
         let main_area = chunks[1];
         let inner = main_block.inner(main_area);
         f.render_widget(main_block, main_area);
+
+        // Determine label prefix and buffer content from the active prompt variant.
+        let (prefix, buf) = match &app.prompt {
+            Some(Prompt::NewSession(s)) => ("new session path: ", s.as_str()),
+            Some(Prompt::Rename(s))     => ("rename session: ",   s.as_str()),
+            None => ("", ""),
+        };
 
         if inner.height > 1 {
             let vsplit = Layout::default()
@@ -103,18 +110,16 @@ pub fn draw(f: &mut Frame, app: &App) {
             }
 
             // Input line.
-            let buf = app.input.as_deref().unwrap_or("");
             let prompt_text = Text::from(Line::from(vec![
-                Span::raw("new session path: "),
+                Span::raw(prefix),
                 Span::raw(buf),
                 Span::raw("_"),
             ]));
             f.render_widget(Paragraph::new(prompt_text), vsplit[1]);
         } else {
             // Terminal too small; just show the input line.
-            let buf = app.input.as_deref().unwrap_or("");
             f.render_widget(
-                Paragraph::new(format!("new session path: {}_", buf)),
+                Paragraph::new(format!("{}{}_", prefix, buf)),
                 inner,
             );
         }

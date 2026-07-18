@@ -51,6 +51,26 @@ pub fn cycle_focus(focus: Focus, home_visible: bool, session_count: usize, delta
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Describes what kind of text prompt is currently active (if any).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Prompt {
+    /// The user is typing a directory path for a new session.
+    NewSession(String),
+    /// The user is typing a new label for the focused session.
+    Rename(String),
+}
+
+impl Prompt {
+    /// Returns a mutable reference to the inner buffer.
+    pub fn buf_mut(&mut self) -> &mut String {
+        match self {
+            Prompt::NewSession(s) | Prompt::Rename(s) => s,
+        }
+    }
+
+
+}
+
 pub struct App {
     pub should_quit: bool,
     pub manager: SessionManager,
@@ -60,8 +80,8 @@ pub struct App {
     pub focus: Focus,
     /// Whether the Home pane is shown in the sidebar.
     pub home_visible: bool,
-    /// When Some, we're in path-input mode (new-session prompt).
-    pub input: Option<String>,
+    /// When Some, we're in a text-input prompt.
+    pub prompt: Option<Prompt>,
     pub leader: bool, // Ctrl-a pressed, awaiting command
     pub claude_path: Option<String>,
     pub icons: IconMode,
@@ -78,7 +98,7 @@ impl App {
             sessions: Vec::new(),
             focus: Focus::Home,
             home_visible: true,
-            input: None,
+            prompt: None,
             leader: false,
             claude_path: pty::resolve_claude_path(),
             icons: icons::detect_mode(),
@@ -188,8 +208,8 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        // Path-input mode: edit the buffer, do NOT forward to any PTY.
-        if self.input.is_some() {
+        // Prompt mode: edit the buffer, do NOT forward to any PTY.
+        if self.prompt.is_some() {
             self.on_input_key(key);
             return;
         }
@@ -200,11 +220,21 @@ impl App {
             match key.code {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Char('n') => {
-                    self.input = Some(
+                    self.prompt = Some(Prompt::NewSession(
                         std::env::current_dir()
                             .map(|p| p.display().to_string())
                             .unwrap_or_default(),
-                    );
+                    ));
+                }
+                KeyCode::Char('r') => {
+                    if let Focus::Session(i) = self.focus {
+                        if let Some((id, _)) = self.sessions.get(i) {
+                            if let Some(s) = self.manager.get(id) {
+                                self.prompt = Some(Prompt::Rename(s.label.clone()));
+                            }
+                        }
+                    }
+                    // Focus::Home → no-op
                 }
                 KeyCode::Char('h') => {
                     self.home_visible = true;
@@ -258,32 +288,45 @@ impl App {
         }
     }
 
-    /// Handle a key while in path-input mode.
+    /// Handle a key while in prompt mode.
     fn on_input_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.input = None;
+                self.prompt = None;
             }
             KeyCode::Enter => {
-                if let Some(buf) = self.input.take() {
-                    let path = PathBuf::from(&buf);
-                    if path.is_dir() {
-                        if let Ok((term_w, term_h)) = crossterm::terminal::size() {
-                            let (rows, cols) = pane_dims(term_w, term_h);
-                            self.start_session(path, rows, cols);
+                if let Some(prompt) = self.prompt.take() {
+                    match prompt {
+                        Prompt::NewSession(buf) => {
+                            let path = PathBuf::from(&buf);
+                            if path.is_dir() {
+                                if let Ok((term_w, term_h)) = crossterm::terminal::size() {
+                                    let (rows, cols) = pane_dims(term_w, term_h);
+                                    self.start_session(path, rows, cols);
+                                }
+                            }
+                            // If not a valid directory, close the prompt without creating a session.
+                        }
+                        Prompt::Rename(buf) => {
+                            let trimmed = buf.trim().to_string();
+                            if !trimmed.is_empty() {
+                                if let Some(id) = self.focused_id() {
+                                    self.manager.rename(&id, &trimmed);
+                                }
+                            }
+                            // Empty buffer → cancel without changing the name.
                         }
                     }
-                    // If not a valid directory, close the prompt without creating a session.
                 }
             }
             KeyCode::Backspace => {
-                if let Some(buf) = self.input.as_mut() {
-                    buf.pop();
+                if let Some(p) = self.prompt.as_mut() {
+                    p.buf_mut().pop();
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(buf) = self.input.as_mut() {
-                    buf.push(c);
+                if let Some(p) = self.prompt.as_mut() {
+                    p.buf_mut().push(c);
                 }
             }
             _ => {}

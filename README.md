@@ -36,6 +36,7 @@ Everything is driven by a **leader key** — press `Ctrl-a`, release, then a com
 | `Ctrl-a` `1`–`9` | Focus session by number |
 | `Ctrl-a` `[` / `]` | Previous / next session |
 | `Ctrl-a` `h` | Back to the Home screen |
+| `Ctrl-a` `r` | Rename the focused session |
 | `Ctrl-a` `x` | Kill the focused session |
 | `Ctrl-a` `q` | Quit |
 

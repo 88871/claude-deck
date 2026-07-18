@@ -1,7 +1,10 @@
-# Tauri + Vanilla TS
+# claude-deck
 
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Typescript.
+A lean, terminal-native desktop app for running and managing multiple Claude Code sessions.
 
-## Recommended IDE Setup
+## Dev
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+```bash
+pnpm install
+pnpm tauri dev
+```

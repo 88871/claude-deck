@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
+use crate::resume;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crate::config::Config;
 use crate::icons::IconMode;
@@ -26,6 +27,7 @@ pub enum Focus {
     Home,
     Session(usize),
     Settings,
+    ResumePicker,
 }
 
 // ── Pure focus-transition helpers (testable without a live PTY) ──────────────
@@ -165,6 +167,15 @@ pub struct App {
     /// Whether crossterm mouse capture is currently enabled.
     /// When false, the terminal's native text selection / copy works.
     pub mouse_on: bool,
+
+    // ── Resume picker (Ctrl-a o) ───────────────────────────────────────────
+
+    /// Scanned past sessions for the resume picker.
+    pub resume_items: Vec<resume::Past>,
+    /// Highlighted row within the filtered resume list.
+    pub resume_cursor: usize,
+    /// Current filter string typed by the user.
+    pub resume_filter: String,
 }
 
 impl App {
@@ -279,6 +290,9 @@ impl App {
             config: cfg,
             settings_cursor: 0,
             mouse_on,
+            resume_items: Vec::new(),
+            resume_cursor: 0,
+            resume_filter: String::new(),
         };
 
         // If the persisted config has mouse disabled, turn off capture now.
@@ -481,7 +495,7 @@ impl App {
         // Determine the search start: use the focused session index, or 0 for Home/Settings.
         let from = match self.focus {
             Focus::Session(i) => i,
-            Focus::Home | Focus::Settings => {
+            Focus::Home | Focus::Settings | Focus::ResumePicker => {
                 // Start from the last session so the search begins at index 0.
                 states.len().saturating_sub(1)
             }
@@ -690,6 +704,12 @@ impl App {
             return;
         }
 
+        // Resume picker mode: filter + navigate the past-sessions list.
+        if self.focus == Focus::ResumePicker {
+            self.on_resume_key(key);
+            return;
+        }
+
         // Leader: Ctrl-a starts a command sequence.
         if self.leader {
             self.leader = false;
@@ -726,7 +746,7 @@ impl App {
                             }
                         }
                         Focus::Session(_) => self.kill_focused(),
-                        Focus::Settings => {} // no-op on Settings screen
+                        Focus::Settings | Focus::ResumePicker => {} // no-op
                     }
                 }
                 KeyCode::Char('R') => {
@@ -773,6 +793,13 @@ impl App {
                     // Open the Settings screen.
                     self.focus = Focus::Settings;
                     self.settings_cursor = 0;
+                }
+                KeyCode::Char('o') => {
+                    // Open the resume picker: scan past sessions and show the list.
+                    self.resume_items = resume::scan(120);
+                    self.resume_filter.clear();
+                    self.resume_cursor = 0;
+                    self.focus = Focus::ResumePicker;
                 }
                 KeyCode::Char('m') => {
                     // Toggle mouse capture. When off, the terminal's native
@@ -931,6 +958,92 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Handle a key while the Resume Picker is focused.
+    /// No keystrokes are forwarded to any PTY.
+    fn on_resume_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.focus = Focus::Home;
+            }
+            KeyCode::Backspace => {
+                if self.resume_filter.pop().is_some() {
+                    // Reset cursor to top after filter change.
+                    self.resume_cursor = 0;
+                }
+            }
+            KeyCode::Up => {
+                if self.resume_cursor > 0 {
+                    self.resume_cursor -= 1;
+                }
+            }
+            KeyCode::Down => {
+                let max = self.resume_filtered_len().saturating_sub(1);
+                if self.resume_cursor < max {
+                    self.resume_cursor += 1;
+                }
+            }
+            KeyCode::PageUp => {
+                self.resume_cursor = self.resume_cursor.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                let max = self.resume_filtered_len().saturating_sub(1);
+                self.resume_cursor = (self.resume_cursor + 10).min(max);
+            }
+            KeyCode::Enter => {
+                // Collect the filtered list, pick the highlighted item.
+                let filter = self.resume_filter.to_lowercase();
+                let filtered: Vec<usize> = self.resume_items.iter().enumerate()
+                    .filter(|(_, p)| resume_matches(p, &filter))
+                    .map(|(i, _)| i)
+                    .collect();
+                if let Some(&orig_idx) = filtered.get(self.resume_cursor) {
+                    let past = self.resume_items[orig_idx].clone();
+                    self.open_past_session(past);
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.resume_filter.push(c);
+                // Reset cursor to top after filter change.
+                self.resume_cursor = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Number of items in the filtered resume list (used to clamp the cursor).
+    fn resume_filtered_len(&self) -> usize {
+        let filter = self.resume_filter.to_lowercase();
+        self.resume_items.iter().filter(|p| resume_matches(p, &filter)).count()
+    }
+
+    /// Open (or focus) a past session from the resume picker.
+    ///
+    /// - If a session with the same id is already open, focus it.
+    /// - Otherwise: create a parked session entry and let the existing revive
+    ///   path resume it via `claude --resume`.
+    fn open_past_session(&mut self, past: resume::Past) {
+        // Check if already open.
+        if let Some(idx) = self.sessions.iter().position(|(id, _)| id == &past.id) {
+            self.focus = Focus::Session(idx);
+            self.maybe_revive_focused();
+            self.sync_focus_size();
+            return;
+        }
+
+        // Register as a parked session.
+        self.manager.create_with_id(past.id.clone(), past.cwd.clone());
+        self.manager.rename(&past.id, &past.title);
+        self.manager.set_state(&past.id, SessionState::Parked);
+        let new_index = self.sessions.len();
+        self.sessions.push((past.id, None));
+        self.save_workspace();
+
+        // Focus the new slot — maybe_revive_focused will spawn `claude --resume`.
+        self.focus = Focus::Session(new_index);
+        self.maybe_revive_focused();
+        self.sync_focus_size();
     }
 
     /// Toggle the boolean setting at the current `settings_cursor` row.
@@ -1274,6 +1387,17 @@ pub fn state_for_hook(ev: &crate::hooks::HookEvent) -> Option<SessionState> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Case-insensitive substring filter for resume-picker items.
+/// Matches if the lowercase `filter` appears in the title or cwd string.
+pub fn resume_matches(past: &resume::Past, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let title_lc = past.title.to_lowercase();
+    let cwd_lc = past.cwd.to_string_lossy().to_lowercase();
+    title_lc.contains(filter) || cwd_lc.contains(filter)
+}
 
 /// Returns the index of the next session (searching AFTER `from`, wrapping)
 /// whose state is `WaitingOnYou`; `None` if there are no such sessions.

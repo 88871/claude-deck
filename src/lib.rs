@@ -8,6 +8,7 @@ pub mod mem;
 pub mod mouse;
 pub mod notify;
 pub mod pty;
+pub mod resume;
 pub mod session;
 pub mod ui;
 pub mod workspace;

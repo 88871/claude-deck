@@ -6,11 +6,12 @@ use ratatui::{
     Frame,
 };
 use tui_term::widget::PseudoTerminal;
-use crate::app::{App, Focus, Prompt};
+use crate::app::{App, Focus, Prompt, resume_matches};
 use crate::home;
 use crate::icons;
 use crate::mem;
 use crate::mouse::SIDEBAR_WIDTH;
+use crate::resume;
 use crate::session::SessionState;
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values. If the string
@@ -150,6 +151,9 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Focus::Settings => {
                     draw_settings_view(f, vsplit[0], app);
                 }
+                Focus::ResumePicker => {
+                    draw_resume_picker(f, vsplit[0], app);
+                }
                 Focus::Session(i) => {
                     match app.sessions.get(i) {
                         Some((_, Some(pty))) => {
@@ -182,13 +186,16 @@ pub fn draw(f: &mut Frame, app: &App) {
             );
         }
     } else {
-        // Normal: render Home, Settings, or the focused session.
+        // Normal: render Home, Settings, Resume Picker, or the focused session.
         match app.focus {
             Focus::Home => {
                 home::render(f, chunks[1], app.sessions.len(), app.icons);
             }
             Focus::Settings => {
                 draw_settings_view(f, chunks[1], app);
+            }
+            Focus::ResumePicker => {
+                draw_resume_picker(f, chunks[1], app);
             }
             Focus::Session(i) => {
                 match app.sessions.get(i) {
@@ -463,6 +470,116 @@ fn draw_settings_view_with_edit(f: &mut Frame, area: Rect, app: &App) {
         ])),
         vsplit[2],
     );
+}
+
+// ── Resume picker renderer ────────────────────────────────────────────────────
+
+/// Render the resume-picker view into `area`.
+pub fn draw_resume_picker(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Resume a past conversation");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let header_text = "type to filter  ·  ↑/↓  ·  Enter open  ·  Esc cancel";
+    let filter_text = format!("filter: {}_", app.resume_filter);
+
+    let filter = app.resume_filter.to_lowercase();
+    let filtered: Vec<&resume::Past> = app
+        .resume_items
+        .iter()
+        .filter(|p| resume_matches(p, &filter))
+        .collect();
+
+    let now = std::time::SystemTime::now();
+
+    // Layout: header (1) | filter line (1) | list (remaining).
+    if inner.height < 3 {
+        f.render_widget(Paragraph::new(filter_text), inner);
+        return;
+    }
+
+    let vsplit = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // header hint
+            Constraint::Length(1), // filter line
+            Constraint::Min(0),    // list
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            header_text,
+            Style::default().fg(Color::DarkGray),
+        )])),
+        vsplit[0],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            filter_text,
+            Style::default().fg(Color::Yellow),
+        )])),
+        vsplit[1],
+    );
+
+    // List area.
+    let list_area = vsplit[2];
+
+    if filtered.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                "(no matches)",
+                Style::default().fg(Color::DarkGray),
+            )])),
+            list_area,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
+        .map(|(i, past)| {
+            let is_cursor = i == app.resume_cursor;
+
+            // Main label: title.
+            let cwd_comp = past
+                .cwd
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let time_str = resume::rel_time(past.mtime, now);
+            let sub = format!("  {} · {}", cwd_comp, time_str);
+
+            let title_style = if is_cursor {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let sub_style = if is_cursor {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            ListItem::new(Text::from(vec![
+                Line::from(vec![Span::styled(past.title.clone(), title_style)]),
+                Line::from(vec![Span::styled(sub, sub_style)]),
+            ]))
+        })
+        .collect();
+
+    f.render_widget(List::new(items), list_area);
 }
 
 /// Shared helper: render the settings list rows into `area`.

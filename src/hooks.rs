@@ -1,6 +1,41 @@
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use serde::Deserialize;
+
+/// A deserialized Claude Code hook payload. Extra JSON fields are ignored.
+#[derive(Deserialize, Debug, Clone)]
+pub struct HookEvent {
+    pub session_id: String,
+    #[serde(rename = "hook_event_name")]
+    pub event: String,
+    #[serde(default)]
+    pub notification_type: Option<String>,
+}
+
+/// Bind a `UnixListener` on `socket_path`, remove any stale socket first,
+/// and spawn a background thread that calls `on_event` for each incoming
+/// well-formed `HookEvent` payload. Bad/unparseable payloads are dropped
+/// silently. Returns immediately after spawning the thread.
+pub fn listen<F: Fn(HookEvent) + Send + 'static>(
+    socket_path: PathBuf,
+    on_event: F,
+) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path)?;
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { continue };
+            let mut buf = Vec::new();
+            if std::io::Read::read_to_end(&mut stream, &mut buf).is_ok() {
+                if let Ok(ev) = serde_json::from_slice::<HookEvent>(&buf) {
+                    on_event(ev);
+                }
+            }
+        }
+    });
+    Ok(())
+}
 
 /// Returns `(socket_path, settings_path)` — both under `temp_dir()`, named
 /// after this process's PID so multiple instances don't collide.
@@ -62,6 +97,17 @@ pub fn forward(socket_path: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_real_hook_payloads() {
+        let ups = r#"{"session_id":"abc","cwd":"/x","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
+        let e: HookEvent = serde_json::from_str(ups).unwrap();
+        assert_eq!(e.session_id, "abc");
+        assert_eq!(e.event, "UserPromptSubmit");
+        let notif = r#"{"session_id":"abc","hook_event_name":"Notification","notification_type":"permission_prompt"}"#;
+        let n: HookEvent = serde_json::from_str(notif).unwrap();
+        assert_eq!(n.notification_type.as_deref(), Some("permission_prompt"));
+    }
 
     #[test]
     fn settings_json_registers_hooks_pointing_at_our_binary() {

@@ -13,6 +13,7 @@ pub enum AppEvent {
     Input(Event),
     Output,
     Exited { id: String, clean: bool },
+    Hook(crate::hooks::HookEvent),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -85,6 +86,10 @@ pub struct App {
     pub leader: bool, // Ctrl-a pressed, awaiting command
     pub claude_path: Option<String>,
     pub icons: IconMode,
+    /// Unix socket path used by the hook listener; removed on quit.
+    socket_path: std::path::PathBuf,
+    /// Temp settings file path written for `--settings`; removed on quit.
+    settings_path: std::path::PathBuf,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
 }
@@ -92,6 +97,15 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
+        let (socket_path, settings_path) = crate::hooks::paths();
+
+        // Start the hook listener — the closure captures a cloned Sender so
+        // hooks.rs stays free of the AppEvent type.
+        let hook_tx = tx.clone();
+        let _ = crate::hooks::listen(socket_path.clone(), move |ev| {
+            let _ = hook_tx.send(AppEvent::Hook(ev));
+        });
+
         Self {
             should_quit: false,
             manager: SessionManager::default(),
@@ -102,6 +116,8 @@ impl App {
             leader: false,
             claude_path: pty::resolve_claude_path(),
             icons: icons::detect_mode(),
+            socket_path,
+            settings_path,
             tx,
             rx,
         }
@@ -139,10 +155,17 @@ impl App {
                         self.should_quit = true;
                     }
                 }
+                // Task A3 will fill in state-machine logic; for now just redraw.
+                Ok(AppEvent::Hook(_ev)) => {}
                 Err(_) => break,
             }
             terminal.draw(|f| ui::draw(f, self))?;
         }
+
+        // Best-effort cleanup of temp files on exit.
+        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_file(&self.settings_path);
+
         Ok(())
     }
 

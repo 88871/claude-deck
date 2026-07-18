@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 use tui_term::widget::PseudoTerminal;
-use crate::app::{App, Focus, Prompt, resume_matches};
+use crate::app::{App, Focus, Prompt, resume_matches, SETTINGS};
 use crate::home;
 use crate::icons;
 use crate::mem;
@@ -361,21 +361,26 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
 
 // ── Settings view renderer ────────────────────────────────────────────────────
 
-/// The ordered list of setting rows: (label, value_fn).
-/// Must match the toggle logic in `App::toggle_settings_bool_at_cursor`.
+/// The ordered list of setting rows: (label, value).
+/// Labels come from `SETTINGS` (the single source of truth).
+/// Order must match `App::toggle_settings_bool_at_cursor`.
 fn settings_rows(app: &App) -> Vec<(&'static str, String)> {
     let cfg = &app.config;
-    vec![
-        ("Do Not Disturb",  bool_val(cfg.dnd)),
-        ("Bell",            bool_val(cfg.bell)),
-        ("Desktop Notify",  bool_val(cfg.desktop_notify)),
-        ("ntfy Topic",      cfg.ntfy_topic.clone().unwrap_or_else(|| "(none)".to_string())),
-        ("Reap Idle",       bool_val(cfg.reap_idle)),
-        ("Reap Timeout",    format!("{} s", cfg.reap_timeout_secs)),
-        ("Mem Warn",        if cfg.mem_warn_mb == 0 { "off".to_string() } else { format!("{} MB", cfg.mem_warn_mb) }),
-        ("Nerd Icons",      bool_val(cfg.nerd_icons)),
-        ("Mouse Capture",   bool_val(cfg.mouse)),
-    ]
+    // Values in the same order as SETTINGS:
+    // 0 dnd, 1 bell, 2 desktop_notify, 3 ntfy_topic, 4 reap_idle,
+    // 5 reap_timeout_secs, 6 mem_warn_mb, 7 nerd_icons, 8 mouse
+    let values: Vec<String> = vec![
+        bool_val(cfg.dnd),
+        bool_val(cfg.bell),
+        bool_val(cfg.desktop_notify),
+        cfg.ntfy_topic.clone().unwrap_or_else(|| "(none)".to_string()),
+        bool_val(cfg.reap_idle),
+        format!("{} s", cfg.reap_timeout_secs),
+        if cfg.mem_warn_mb == 0 { "off".to_string() } else { format!("{} MB", cfg.mem_warn_mb) },
+        bool_val(cfg.nerd_icons),
+        bool_val(cfg.mouse),
+    ];
+    SETTINGS.iter().zip(values.into_iter()).map(|(meta, val)| (meta.label, val)).collect()
 }
 
 fn bool_val(b: bool) -> String {
@@ -395,26 +400,56 @@ fn draw_settings_view(f: &mut Frame, area: Rect, app: &App) {
 
     // Header line.
     let header = Line::from(vec![Span::styled(
-        "Settings — ↑/↓ move · Enter toggle/edit · Space toggle · Esc back",
+        "↑/↓ move · Enter toggle/edit · Space toggle · Esc back  (see hint below)",
         Style::default().fg(Color::DarkGray),
     )]);
 
     let rows = settings_rows(app);
 
-    // Split inner: header (1 row) + list (remaining).
+    // Help line: description of the currently highlighted setting.
+    let help_text = SETTINGS
+        .get(app.settings_cursor)
+        .map(|m| m.description)
+        .unwrap_or("");
+    let help_line = Line::from(vec![Span::styled(
+        help_text,
+        Style::default().fg(Color::Cyan),
+    )]);
+
+    // Layout: header (1) | list (remaining) | help line (1).
+    // Need at least 3 rows for header + list + help.
     if inner.height < 2 {
         f.render_widget(Paragraph::new(header), inner);
         return;
     }
 
-    let vsplit = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
+    let (list_constraint, show_help) = if inner.height >= 3 {
+        (Constraint::Min(0), true)
+    } else {
+        // height == 2: header + list only, no help line
+        (Constraint::Min(0), false)
+    };
 
-    f.render_widget(Paragraph::new(header), vsplit[0]);
-
-    render_settings_list(f, vsplit[1], app, &rows);
+    if show_help {
+        let vsplit = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // header
+                list_constraint,       // list
+                Constraint::Length(1), // help line
+            ])
+            .split(inner);
+        f.render_widget(Paragraph::new(header), vsplit[0]);
+        render_settings_list(f, vsplit[1], app, &rows);
+        f.render_widget(Paragraph::new(help_line), vsplit[2]);
+    } else {
+        let vsplit = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), list_constraint])
+            .split(inner);
+        f.render_widget(Paragraph::new(header), vsplit[0]);
+        render_settings_list(f, vsplit[1], app, &rows);
+    }
 }
 
 /// Render the settings view with an active EditSetting prompt at the bottom.
@@ -431,13 +466,20 @@ fn draw_settings_view_with_edit(f: &mut Frame, area: Rect, app: &App) {
 
     // Header line.
     let header = Line::from(vec![Span::styled(
-        "Settings — ↑/↓ move · Enter toggle/edit · Space toggle · Esc back",
+        "↑/↓ move · Enter toggle/edit · Space toggle · Esc back  (see hint below)",
         Style::default().fg(Color::DarkGray),
     )]);
 
     let rows = settings_rows(app);
 
-    // Layout: header | list | edit line
+    // Help line: description of the currently highlighted setting.
+    let help_text = SETTINGS
+        .get(app.settings_cursor)
+        .map(|m| m.description)
+        .unwrap_or("");
+
+    // Layout: header | list | help line | edit line
+    // Need at least 3 rows: we always show at least header + edit line.
     if area.height < 3 {
         // Too small: just show the edit line.
         let edit_text = format!("edit {}: {}_", setting_key.label(), buf);
@@ -450,26 +492,62 @@ fn draw_settings_view_with_edit(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // With 4+ rows: header | list | help | edit.
+    // With exactly 3 rows: header | list | edit (skip help).
+    let (constraints, has_help) = if area.height >= 4 {
+        (
+            vec![
+                Constraint::Length(1), // header
+                Constraint::Min(1),    // list
+                Constraint::Length(1), // help line
+                Constraint::Length(1), // edit line
+            ],
+            true,
+        )
+    } else {
+        (
+            vec![
+                Constraint::Length(1), // header
+                Constraint::Min(1),    // list
+                Constraint::Length(1), // edit line
+            ],
+            false,
+        )
+    };
+
     let vsplit = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),  // header
-            Constraint::Min(1),     // list
-            Constraint::Length(1),  // edit line
-        ])
+        .constraints(constraints)
         .split(area);
 
     f.render_widget(Paragraph::new(header), vsplit[0]);
     render_settings_list(f, vsplit[1], app, &rows);
 
-    // Edit line at the bottom.
-    let edit_text = format!("edit {}: {}_", setting_key.label(), buf);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(edit_text, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ])),
-        vsplit[2],
-    );
+    if has_help {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(help_text, Style::default().fg(Color::Cyan)),
+            ])),
+            vsplit[2],
+        );
+        // Edit line at index 3.
+        let edit_text = format!("edit {}: {}_", setting_key.label(), buf);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(edit_text, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ])),
+            vsplit[3],
+        );
+    } else {
+        // Edit line at index 2.
+        let edit_text = format!("edit {}: {}_", setting_key.label(), buf);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(edit_text, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ])),
+            vsplit[2],
+        );
+    }
 }
 
 // ── Resume picker renderer ────────────────────────────────────────────────────

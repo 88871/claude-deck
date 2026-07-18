@@ -32,10 +32,9 @@ pub enum Focus {
 
 // ── Pure focus-transition helpers (testable without a live PTY) ──────────────
 
-/// Build the ordered list of visible "slots" for cycling: Home (if visible) then each
-/// session index.  Returns indices as `Focus` values.
-/// `Focus::Settings` is excluded — it is pinned at the sidebar bottom and not part
-/// of the cycling loop.
+/// Build the ordered list of visible "slots" for cycling:
+/// Home (if visible) → each session index → Settings (always last).
+/// This is the unified cycle for both `[`/`]` and `Ctrl-a Up/Down`.
 pub fn visible_entries(home_visible: bool, session_count: usize) -> Vec<Focus> {
     let mut v = Vec::new();
     if home_visible {
@@ -44,13 +43,15 @@ pub fn visible_entries(home_visible: bool, session_count: usize) -> Vec<Focus> {
     for i in 0..session_count {
         v.push(Focus::Session(i));
     }
+    v.push(Focus::Settings);
     v
 }
 
 /// Compute the next focus when cycling forward (+1) or backward (-1).
 /// Returns the current focus unchanged if there are no visible entries.
-/// `Focus::Settings` is not in the cycle list; when cycling from Settings,
-/// position defaults to 0 (same fallback as an unrecognised entry).
+/// The cycle is: Home → sessions → Settings → Home (wrapping).
+/// When the current focus is not found in the list (e.g. ResumePicker),
+/// position defaults to 0.
 pub fn cycle_focus(focus: Focus, home_visible: bool, session_count: usize, delta: i32) -> Focus {
     let entries = visible_entries(home_visible, session_count);
     if entries.is_empty() {
@@ -82,6 +83,57 @@ impl SettingKey {
         }
     }
 }
+
+/// Metadata for a single settings row: plain-language label + one-sentence description.
+/// Used by both the settings list renderer and the help line at the bottom of the pane.
+pub struct SettingMeta {
+    /// Short plain-language label shown in the list.
+    pub label: &'static str,
+    /// One–two sentence description shown in the help line when this row is highlighted.
+    pub description: &'static str,
+}
+
+/// Canonical ordered table of all settings rows.
+/// **Order must match** `toggle_settings_bool_at_cursor` and the `Enter` match
+/// in `on_settings_key` (row 3 = NtfyTopic, 5 = ReapTimeout, 6 = MemWarn).
+pub const SETTINGS: &[SettingMeta] = &[
+    SettingMeta {
+        label: "Do Not Disturb (mute all alerts)",
+        description: "Silences the bell, desktop notifications, and phone push all at once.",
+    },
+    SettingMeta {
+        label: "Terminal bell on alert",
+        description: "Rings the terminal bell when an unfocused session needs your attention.",
+    },
+    SettingMeta {
+        label: "Desktop notifications",
+        description: "Shows a desktop notification when an unfocused session needs you.",
+    },
+    SettingMeta {
+        label: "Phone push topic (ntfy)",
+        description: "Get phone pushes via ntfy.sh. Subscribe to this topic in the ntfy app on your phone. Empty = off.",
+    },
+    SettingMeta {
+        label: "Auto-sleep idle sessions",
+        description: "Automatically sleep (kill the process of) idle, unfocused sessions to free RAM. They resume automatically when you open them. Off by default.",
+    },
+    SettingMeta {
+        label: "Sleep after (seconds idle)",
+        description: "How long a session must sit idle and unfocused before it auto-sleeps (only if Auto-sleep is on).",
+    },
+    SettingMeta {
+        label: "Warn at memory usage (MB)",
+        description: "Warn (sidebar marker + notification) when a session's memory passes this. Advisory only — it never kills anything.",
+    },
+    SettingMeta {
+        label: "Nerd Font icons",
+        description: "Use Nerd Font icon glyphs (requires your terminal to use a Nerd Font). Off = universal Unicode symbols.",
+    },
+    SettingMeta {
+        label: "Mouse capture (turn off for native copy/paste)",
+        description: "When on, click to focus rows and scroll. Turn OFF to use your terminal's native text selection and copy.",
+    },
+];
 
 /// Describes what kind of text prompt is currently active (if any).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -766,15 +818,23 @@ impl App {
                         self.sync_focus_size();
                     }
                 }
-                KeyCode::Char('[') => {
+                KeyCode::Char('[') | KeyCode::Up => {
                     self.focus = cycle_focus(self.focus, self.home_visible, self.sessions.len(), -1);
-                    self.maybe_revive_focused();
-                    self.sync_focus_size();
+                    if self.focus == Focus::Settings {
+                        self.settings_cursor = 0;
+                    } else {
+                        self.maybe_revive_focused();
+                        self.sync_focus_size();
+                    }
                 }
-                KeyCode::Char(']') => {
+                KeyCode::Char(']') | KeyCode::Down => {
                     self.focus = cycle_focus(self.focus, self.home_visible, self.sessions.len(), 1);
-                    self.maybe_revive_focused();
-                    self.sync_focus_size();
+                    if self.focus == Focus::Settings {
+                        self.settings_cursor = 0;
+                    } else {
+                        self.maybe_revive_focused();
+                        self.sync_focus_size();
+                    }
                 }
                 KeyCode::Char('!') => {
                     self.jump_to_attention();
@@ -1422,40 +1482,61 @@ mod tests {
 
     #[test]
     fn visible_entries_home_visible_includes_home_first() {
+        // Settings is always the last entry.
         let v = visible_entries(true, 2);
-        assert_eq!(v, vec![Focus::Home, Focus::Session(0), Focus::Session(1)]);
+        assert_eq!(v, vec![Focus::Home, Focus::Session(0), Focus::Session(1), Focus::Settings]);
     }
 
     #[test]
     fn visible_entries_home_hidden_excludes_home() {
         let v = visible_entries(false, 2);
-        assert_eq!(v, vec![Focus::Session(0), Focus::Session(1)]);
+        assert_eq!(v, vec![Focus::Session(0), Focus::Session(1), Focus::Settings]);
     }
 
     #[test]
     fn visible_entries_no_sessions_home_visible() {
         let v = visible_entries(true, 0);
-        assert_eq!(v, vec![Focus::Home]);
+        assert_eq!(v, vec![Focus::Home, Focus::Settings]);
     }
 
     #[test]
-    fn visible_entries_empty_when_home_hidden_no_sessions() {
+    fn visible_entries_no_sessions_home_hidden_only_settings() {
+        // Home hidden, no sessions → only Settings remains.
         let v = visible_entries(false, 0);
-        assert!(v.is_empty());
+        assert_eq!(v, vec![Focus::Settings]);
+    }
+
+    #[test]
+    fn visible_entries_settings_always_last() {
+        let v = visible_entries(true, 3);
+        assert_eq!(v.last(), Some(&Focus::Settings));
     }
 
     // ── cycle_focus ───────────────────────────────────────────────────────────
+    // Cycle order: Home → Session(0) → … → Session(n-1) → Settings → Home.
 
     #[test]
-    fn cycle_forward_wraps_home_sessions() {
-        // [Home, S0, S1] forward from S1 → Home
-        assert_eq!(cycle_focus(Focus::Session(1), true, 2, 1), Focus::Home);
+    fn cycle_forward_from_last_session_to_settings() {
+        // [Home, S0, S1, Settings] forward from S1 → Settings
+        assert_eq!(cycle_focus(Focus::Session(1), true, 2, 1), Focus::Settings);
     }
 
     #[test]
-    fn cycle_backward_wraps_home_sessions() {
-        // [Home, S0, S1] backward from Home → S1
-        assert_eq!(cycle_focus(Focus::Home, true, 2, -1), Focus::Session(1));
+    fn cycle_forward_from_settings_wraps_to_home() {
+        // [Home, S0, S1, Settings] forward from Settings → Home
+        assert_eq!(cycle_focus(Focus::Settings, true, 2, 1), Focus::Home);
+    }
+
+    #[test]
+    fn cycle_backward_from_home_wraps_to_settings() {
+        // [Home, S0, S1, Settings] backward from Home → Settings
+        assert_eq!(cycle_focus(Focus::Home, true, 2, -1), Focus::Settings);
+    }
+
+    #[test]
+    fn cycle_backward_from_settings_to_last_session() {
+        // [Home, S0, S1, Settings] backward from Settings → S1
+        assert_eq!(cycle_focus(Focus::Settings, true, 2, -1), Focus::Session(1));
     }
 
     #[test]
@@ -1464,36 +1545,63 @@ mod tests {
     }
 
     #[test]
-    fn cycle_home_skipped_when_hidden() {
-        // [S0, S1] forward from S1 → S0 (Home not in list)
-        assert_eq!(cycle_focus(Focus::Session(1), false, 2, 1), Focus::Session(0));
+    fn cycle_home_skipped_when_hidden_forward_from_last_session() {
+        // [S0, S1, Settings] forward from S1 → Settings
+        assert_eq!(cycle_focus(Focus::Session(1), false, 2, 1), Focus::Settings);
+    }
+
+    #[test]
+    fn cycle_home_skipped_when_hidden_settings_wraps_to_s0() {
+        // [S0, S1, Settings] forward from Settings → S0
+        assert_eq!(cycle_focus(Focus::Settings, false, 2, 1), Focus::Session(0));
     }
 
     #[test]
     fn cycle_home_skipped_backward_when_hidden() {
-        // [S0, S1] backward from S0 → S1
-        assert_eq!(cycle_focus(Focus::Session(0), false, 2, -1), Focus::Session(1));
+        // [S0, S1, Settings] backward from S0 → Settings
+        assert_eq!(cycle_focus(Focus::Session(0), false, 2, -1), Focus::Settings);
     }
 
     #[test]
-    fn cycle_single_entry_stays_put() {
-        // Only Home visible, no sessions — stays Home
-        assert_eq!(cycle_focus(Focus::Home, true, 0, 1), Focus::Home);
-        assert_eq!(cycle_focus(Focus::Home, true, 0, -1), Focus::Home);
+    fn cycle_single_entry_only_settings() {
+        // Home hidden, no sessions → only Settings. Cycling stays there.
+        assert_eq!(cycle_focus(Focus::Settings, false, 0, 1), Focus::Settings);
+        assert_eq!(cycle_focus(Focus::Settings, false, 0, -1), Focus::Settings);
     }
 
     #[test]
-    fn cycle_no_entries_returns_current() {
-        // Home hidden, no sessions — returns current unchanged
-        assert_eq!(cycle_focus(Focus::Session(0), false, 0, 1), Focus::Session(0));
+    fn cycle_home_and_settings_only_no_sessions() {
+        // [Home, Settings]: forward from Home → Settings → Home
+        assert_eq!(cycle_focus(Focus::Home, true, 0, 1), Focus::Settings);
+        assert_eq!(cycle_focus(Focus::Settings, true, 0, 1), Focus::Home);
+    }
+
+    #[test]
+    fn cycle_full_forward_loop_includes_settings() {
+        // [Home, S0, S1, Settings] — walk all the way around forward.
+        let mut f = Focus::Home;
+        f = cycle_focus(f, true, 2, 1); assert_eq!(f, Focus::Session(0));
+        f = cycle_focus(f, true, 2, 1); assert_eq!(f, Focus::Session(1));
+        f = cycle_focus(f, true, 2, 1); assert_eq!(f, Focus::Settings);
+        f = cycle_focus(f, true, 2, 1); assert_eq!(f, Focus::Home); // wrapped
+    }
+
+    #[test]
+    fn cycle_full_backward_loop_includes_settings() {
+        // [Home, S0, S1, Settings] — walk all the way around backward from Home.
+        let mut f = Focus::Home;
+        f = cycle_focus(f, true, 2, -1); assert_eq!(f, Focus::Settings);
+        f = cycle_focus(f, true, 2, -1); assert_eq!(f, Focus::Session(1));
+        f = cycle_focus(f, true, 2, -1); assert_eq!(f, Focus::Session(0));
+        f = cycle_focus(f, true, 2, -1); assert_eq!(f, Focus::Home); // wrapped
     }
 
     // ── cycle_focus stale-focus recovery ──────────────────────────────────────
 
     #[test]
     fn cycle_stale_focus_recovers_to_visible_entry() {
-        // When focus is Session(5) but only [Home, Session(0), Session(1)] are visible,
-        // cycling forward from the default recovered position (0) yields Session(0).
+        // When focus is Session(5) but only [Home, Session(0), Session(1), Settings]
+        // are visible, cycling forward from the default recovered position (0) yields S0.
         assert_eq!(
             cycle_focus(Focus::Session(5), true, 2, 1),
             Focus::Session(0)
@@ -1683,6 +1791,40 @@ mod tests {
         assert!(!SettingKey::NtfyTopic.label().is_empty());
         assert!(!SettingKey::ReapTimeout.label().is_empty());
         assert!(!SettingKey::MemWarn.label().is_empty());
+    }
+
+    // ── SETTINGS metadata table ───────────────────────────────────────────────
+
+    #[test]
+    fn settings_table_has_correct_count() {
+        assert_eq!(SETTINGS.len(), SETTINGS_ROW_COUNT_TOTAL);
+    }
+
+    #[test]
+    fn settings_table_all_labels_nonempty() {
+        for meta in SETTINGS.iter() {
+            assert!(!meta.label.is_empty(), "empty label found");
+        }
+    }
+
+    #[test]
+    fn settings_table_all_descriptions_nonempty() {
+        for meta in SETTINGS.iter() {
+            assert!(!meta.description.is_empty(), "empty description for label: {}", meta.label);
+        }
+    }
+
+    #[test]
+    fn settings_table_plain_language_labels_spot_check() {
+        assert!(SETTINGS[0].label.contains("Do Not Disturb"));
+        assert!(SETTINGS[1].label.to_lowercase().contains("bell"));
+        assert!(SETTINGS[2].label.to_lowercase().contains("desktop"));
+        assert!(SETTINGS[3].label.to_lowercase().contains("ntfy"));
+        assert!(SETTINGS[4].label.to_lowercase().contains("sleep") || SETTINGS[4].label.to_lowercase().contains("idle") || SETTINGS[4].label.to_lowercase().contains("auto"));
+        assert!(SETTINGS[5].label.to_lowercase().contains("second") || SETTINGS[5].label.to_lowercase().contains("sleep"));
+        assert!(SETTINGS[6].label.to_lowercase().contains("mem") || SETTINGS[6].label.to_lowercase().contains("mb") || SETTINGS[6].label.to_lowercase().contains("warn"));
+        assert!(SETTINGS[7].label.to_lowercase().contains("nerd") || SETTINGS[7].label.to_lowercase().contains("font") || SETTINGS[7].label.to_lowercase().contains("icon"));
+        assert!(SETTINGS[8].label.to_lowercase().contains("mouse"));
     }
 
     #[test]
